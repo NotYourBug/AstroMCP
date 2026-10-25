@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-import json, re, ipaddress
-from pathlib import Path
+import ipaddress
+import json
+import re
 from collections.abc import Mapping
-from typing import Optional
+from pathlib import Path
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 HOST_FORBIDDEN = re.compile(r"[;&|`$(){}\[\]<>\"']")
+
+
 class HostSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     tool_timeout_seconds: float = Field(default=30, gt=0)
@@ -18,7 +23,7 @@ class HostSettings(BaseModel):
     ssh_output_limit_bytes: int = Field(default=262144, ge=1)
     ssh_known_hosts: str | None = None
     disk_threshold: int = Field(default=85, ge=0, le=100)
-    transport: str = "stdio"
+    transport: Literal["stdio", "http", "sse"] = "stdio"
     bind_host: str = "127.0.0.1"
     bind_port: int = Field(default=8081, ge=1, le=65535)
 
@@ -44,13 +49,15 @@ def load_settings(environ: Mapping[str, str], config_path: Path | None = None) -
         "MCP_SSH_OUTPUT_LIMIT_BYTES": "ssh_output_limit_bytes",
         "MCP_SSH_KNOWN_HOSTS": "ssh_known_hosts",
         "MCP_DISK_THRESHOLD": "disk_threshold",
-        "MCP_TRANSPORT": "transport", "MCP_BIND_HOST": "bind_host", "MCP_BIND_PORT": "bind_port",
+        "MCP_TRANSPORT": "transport",
+        "MCP_BIND_HOST": "bind_host",
+        "MCP_BIND_PORT": "bind_port",
     }
     data.update({field: environ[key] for key, field in names.items() if key in environ})
     return HostSettings.model_validate(data)
 
 
-def _check_host(host: str) -> Optional[str]:
+def _check_host(host: str) -> str | None:
     """校验主机名/IP，合法返回 None，否则返回错误信息"""
     if not host or not host.strip():
         return "host 不能为空"
@@ -59,19 +66,22 @@ def _check_host(host: str) -> Optional[str]:
     try:
         ipaddress.ip_address(host)
     except ValueError:
-        if len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?", label) for label in host.rstrip(".").split(".")):
+        if len(host) > 253 or not all(
+            re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?", label)
+            for label in host.rstrip(".").split(".")
+        ):
             return "Invalid hostname or IP"
     return None
 
 
-def _check_port(port: int) -> Optional[str]:
+def _check_port(port: int) -> str | None:
     """校验端口号，合法返回 None，否则返回错误信息"""
     if not isinstance(port, int) or port < 1 or port > 65535:
         return f"port 超出范围 1-65535: {port}"
     return None
 
 
-def _check_path(path: str) -> Optional[str]:
+def _check_path(path: str) -> str | None:
     """校验路径，合法返回 None，否则返回错误信息"""
     if not path or not path.strip():
         return "path 不能为空"
@@ -83,4 +93,3 @@ def _check_path(path: str) -> Optional[str]:
 def is_local(host: str) -> bool:
     """判断给定的 host 是否指代本机"""
     return host in ("127.0.0.1", "localhost", "0.0.0.0", "::1")
-

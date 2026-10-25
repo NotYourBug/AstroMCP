@@ -1,4 +1,5 @@
 """Compatibility entrypoint; install with uv sync --all-packages first."""
+
 try:
     from resource_check_mcp.__main__ import main
 except ModuleNotFoundError as exc:

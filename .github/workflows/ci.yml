@@ -1,0 +1,39 @@
+name: checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked --all-packages --all-extras --dev --python ${{ matrix.python }}
+      - run: uv run --frozen --all-packages --all-extras --python ${{ matrix.python }} ruff check .
+      - run: uv run --frozen --all-packages --all-extras --python ${{ matrix.python }} ruff format --check .
+      - run: uv run --frozen --all-packages --all-extras --python ${{ matrix.python }} python -m pytest -q --junitxml=reports/tests.xml
+      - run: uv build --package astromcp-host
+      - run: uv build --package astromcp-k8s
+      - run: uv run --frozen --all-packages --all-extras --python ${{ matrix.python }} python scripts/verify_packages.py
+      - run: uv run --frozen --all-packages --all-extras --python ${{ matrix.python }} python scripts/verify_inventory.py
+      - run: python scripts/verify_public_files.py --tracked
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checks-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            reports/*.xml
+            dist/*

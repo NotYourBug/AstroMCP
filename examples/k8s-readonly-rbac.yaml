@@ -1,0 +1,34 @@
+# TEST_ONLY example: inspect and adapt namespaces/permissions before use.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: astromcp-test-only
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: astromcp-test-only
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: astromcp-test-only
+subjects:
+  - kind: ServiceAccount
+    name: astromcp-test-only
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: astromcp-test-only

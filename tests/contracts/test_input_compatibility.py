@@ -5,7 +5,9 @@ from fastmcp import Client
 
 
 async def test_original_parameters(legacy_module):
-    baseline = json.loads((Path(__file__).parent / "baseline_inventory.json").read_text(encoding="utf-8"))
+    baseline = json.loads(
+        (Path(__file__).parent / "baseline_inventory.json").read_text(encoding="utf-8")
+    )
     for kind in ("host", "k8s"):
         async with Client(legacy_module(kind).mcp) as client:
             tools = {t.name: t.inputSchema for t in await client.list_tools()}

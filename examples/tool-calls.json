@@ -1,0 +1,19 @@
+{
+  "host": [
+    {"name": "check_mem", "arguments": {"host": "127.0.0.1"}},
+    {"name": "check_cpu", "arguments": {"host": "127.0.0.1"}},
+    {"name": "check_disk_usage", "arguments": {"host": "127.0.0.1", "path": "/", "threshold": 85}},
+    {"name": "check_tcp", "arguments": {"host": "127.0.0.1"}},
+    {"name": "check_host_status", "arguments": {"hostname": "127.0.0.1"}},
+    {"name": "check_service_port", "arguments": {"host": "127.0.0.1", "port": 8081}}
+  ],
+  "k8s": [
+    {"name": "health_check", "arguments": {}},
+    {"name": "list_nodes", "arguments": {"limit": 100}},
+    {"name": "get_node_detail", "arguments": {"node_name": "TEST_ONLY_NODE"}},
+    {"name": "get_node_resource_usage", "arguments": {"node_name": "TEST_ONLY_NODE"}},
+    {"name": "find_problem_nodes", "arguments": {"max_results": 100}},
+    {"name": "list_node_pods", "arguments": {"node_name": "TEST_ONLY_NODE", "limit": 100}},
+    {"name": "diagnose_pod_issues", "arguments": {"namespace": "TEST_ONLY_NAMESPACE", "pod_name": "TEST_ONLY_POD"}}
+  ]
+}

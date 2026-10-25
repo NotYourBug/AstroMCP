@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import re
-from ._common import _percent, _memory_fields
-from .linux import parse_disk_output, parse_tcp_output, build_disk_command
+
+from ._common import _memory_fields, _percent
+from .linux import build_disk_command as build_disk_command
+from .linux import parse_disk_output as parse_disk_output
+from .linux import parse_tcp_output as parse_tcp_output
+
 
 def parse_cpu_mac(text: str) -> float:
     samples = re.findall(r"([\d.]+)%\s+idle", text)
     if not samples:
         raise ValueError("top idle field missing")
-    return _percent(100-float(samples[-1]))
+    return _percent(100 - float(samples[-1]))
 
 
 def parse_memory_mac(text: str) -> dict:
@@ -17,8 +21,11 @@ def parse_memory_mac(text: str) -> dict:
     match = re.search(r"([\d.]+)([GMK]?)\s+unused", text)
     if not match:
         raise ValueError("PhysMem unused field missing")
-    free = float(match[1])*{"G":1024**3,"M":1024**2,"K":1024,"":1}[match[2]]
-    return {**_memory_fields(total, free), "memory_basis": "macOS PhysMem unused; not Linux MemAvailable"}
+    free = float(match[1]) * {"G": 1024**3, "M": 1024**2, "K": 1024, "": 1}[match[2]]
+    return {
+        **_memory_fields(total, free),
+        "memory_basis": "macOS PhysMem unused; not Linux MemAvailable",
+    }
 
 
 parse_cpu_output = parse_cpu_mac

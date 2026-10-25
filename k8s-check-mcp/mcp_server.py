@@ -1,4 +1,5 @@
 """Compatibility SSE entrypoint; install AstroMCP before running."""
+
 try:
     from k8s_check_mcp.__main__ import main
 except ModuleNotFoundError as exc:
