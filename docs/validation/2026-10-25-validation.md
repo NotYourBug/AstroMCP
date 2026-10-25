@@ -24,7 +24,7 @@ Windows 受限沙箱内的 asyncio socketpair accept 阻塞已通过堆栈定位
 | K8s 资源与诊断 | Decimal/sidecar/init/overhead/limit/resize/Pod-level、Ready/Pending/OOM | fixture 通过；不支持模型明确 unknown |
 | K8s Events/log | UID、时间排序、API 字节限额、截断、常见脱敏 | 模拟通过；不能保证识别任意业务敏感值 |
 | K8s 凭据与健康调用 | 不存在的临时 kubeconfig，协议中返回 CONFIG_ERROR | 通过；未调用默认用户集群 |
-| Ubuntu/Windows × Python 3.10/3.12 | `.github/workflows/ci.yml` | 配置完成，远程未运行；本机仅 3.11 |
+| Ubuntu/Windows × Python 3.10/3.12 | `.github/workflows/ci.yml`、[PR #1 检查](https://github.com/NotYourBug/AstroMCP/pull/1/checks) | 已实际运行；首次 Ubuntu 两组通过，Windows 计时测试的浮点断言误报已修正，后续结果以 PR 当前检查为准 |
 | 真集群与平台兼容矩阵 | 尚无测试基础设施/凭据 | 未验证，无 skip 冒充通过 |
 | 负载、长稳、漏洞扫描 | 本轮未执行 | 预算和模拟并发不等于生产容量结论 |
 
@@ -33,3 +33,9 @@ Windows 受限沙箱内的 asyncio socketpair accept 阻塞已通过堆栈定位
 在隔离测试主机核对 known_hosts 拒绝/接受、各平台命令和权限；在隔离集群以示例 RBAC 核对 Node/Pod/metrics/events/log 的允许与拒绝路径，记录 Kubernetes 服务端、metrics-server、SDK 和平台版本。再测试有量化目标的负载、取消、长稳和内存增长。团队远程部署须先单独完成认证授权设计。
 
 没有自动发布、远程合并或生产变更；CI 是否通过以仓库实际运行结果为准。
+
+## 首次远程交付
+
+用户确认仓库为空并批准推送后，以 `50f4b40` 初始化 `main`，推送完整工作分支并创建 [Draft PR #1](https://github.com/NotYourBug/AstroMCP/pull/1)，保留全部任务提交历史。
+
+首次 [push CI](https://github.com/NotYourBug/AstroMCP/actions/runs/40168583070) 的 Ubuntu / Python 3.10、3.12 全部通过。Windows 两组均为 128 passed、1 failed，失败值为 `0.05000000000001137 <= 0.05` 的严格浮点比较。`test_probes_receive_remaining_tool_budget` 已改为可控时钟和近似比较，直接验证扣除经过时间后的 40 ms / 30 ms 预算，保持对错误五秒预算的回归检测。生产超时行为未变；复验结果以 PR 当前 head 的检查为准。

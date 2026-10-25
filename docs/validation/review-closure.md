@@ -1,6 +1,6 @@
 # AstroMCP 审查关闭记录
 
-2026-10-25。用户批准同仓库两个独立 MCP 包并选择本会话顺序实施。原始基线 `50f4b40`；独立审查范围 `50f4b40..0fb6c08`，后续修复提交 `22dea2f`。本地全套 **129 passed**；Ruff check、format 和公开路径检查通过。真实 SSH/集群、远程 CI 尚未验证。
+2026-10-25。用户批准同仓库两个独立 MCP 包并选择本会话顺序实施。原始基线 `50f4b40`；独立审查范围 `50f4b40..0fb6c08`，后续修复提交 `22dea2f`。本地全套 **129 passed**；Ruff check、format 和公开路径检查通过。真实 SSH/集群尚未验证，远程 CI 结果见 [PR #1 检查](https://github.com/NotYourBug/AstroMCP/pull/1/checks)。
 
 “通过”仅指下列本地证据，真实主机、集群与远程 CI 的范围见[验证矩阵](2026-10-25-validation.md)。原始审查保留在[历史报告](../../MCP代码审查与优化建议.md)，旧源码行号仅用于定位当时版本。
 
@@ -79,4 +79,4 @@ Host 文件位于 `resource-check-mcp/src/resource_check_mcp/`，K8s 文件位�
 
 21 项追踪清单、公开文件路径、常见敏感内容候选检查与分支 diff 检查均已执行。内容候选只命中脱敏实现和测试中的示例文本，没有发现真实凭据；这不是完整的秘密/漏洞扫描。
 
-本地分支保留任务提交历史，尚未 push、建立远程 main 或创建 PR。没有添加许可证、自动部署或 PyPI 发布；首次推送按批准计划在用户审阅交付结果后决定。
+用户审阅交付结果后已批准首次推送。远程 `main` 保留 `50f4b40` 原始审查基线，完整修复在 `feat/astromcp-foundation` 和 [Draft PR #1](https://github.com/NotYourBug/AstroMCP/pull/1)，尚未合并。首次远程 CI 发现的 Windows 浮点测试误报和复验入口已补充到验证记录；此前裁决第 9 项的 CI 状态以该后续记录为准，实机边界保持不变。没有添加许可证、自动部署或 PyPI 发布。

@@ -1,5 +1,7 @@
 import time
+from types import SimpleNamespace
 
+import pytest
 from resource_check_mcp.config import HostSettings
 from resource_check_mcp.models import SSHConnection
 from resource_check_mcp.ssh import SSHExecutor
@@ -10,6 +12,10 @@ async def test_probes_receive_remaining_tool_budget(monkeypatch):
     import resource_check_mcp.server as module
 
     observed = []
+    # Control elapsed time instead of comparing a real platform clock's rounded
+    # subtraction with an exact 50 ms upper bound.
+    ticks = iter((256.0, 256.01, 512.0, 512.02))
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
 
     async def probe(*args, timeout=5):
         observed.append(timeout)
@@ -21,7 +27,7 @@ async def test_probes_receive_remaining_tool_budget(monkeypatch):
     try:
         await service.check_host_status("localhost")
         await service.check_service_port("localhost", 80)
-        assert len(observed) == 2 and all(0 < value <= 0.05 for value in observed)
+        assert observed == pytest.approx([0.04, 0.03])
     finally:
         await service.aclose()
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans（推荐本会话顺序实施）或 superpowers:subagent-driven-development 按任务实施。Steps use checkbox (`- [x]`) syntax for tracking.
 
-执行状态（2026-10-25）：M1–M5 本地实施与验收完成；首次 push/PR 是用户审阅后触发的集成阶段，当前尚未执行，远程 CI 待运行。
+执行状态（2026-10-25）：M1–M5 本地实施与验收完成；用户已批准首次推送，空仓库的 main 与工作分支已建立，[Draft PR #1](https://github.com/NotYourBug/AstroMCP/pull/1) 已创建。远程 CI 已运行，最新结果见 PR 检查；不自动合并。
 
 **Goal:** 在一个 GitHub 仓库内交付可独立安装、启动、测试的两个 MCP 包，完整落实既有审查的修复范围。
 
@@ -106,7 +106,7 @@ M1 原始基线 → M2 可复现依赖与契约基线
 - [x] Step 1：用 R1–R9、K1–K9、部署、依赖、文档作为固定集合，测试或检查每项有任务、证据与状态；未实测的事项不能标已完成验证。扫描最终 `git diff --check`、待公开文件清单与例子中的敏感值。
 - [x] Step 2：运行一次全分支独立审查（执行方式由用户确认；主代理顺序实施也需结束时独立 reviewer），重点检查权限边界、取消后线程、SDK 模型字段丢失、资源算法、Schema 兼容。按真实失败修复并补相应测试，不为无关风格重复重跑所有平台。
 - [x] Step 3：完成 review-closure 与最终测试结果。核对没有未经批准的许可证/自动部署/PyPI 发布。用 `git log` 和 staged 清单展示原始基线、任务提交和当前 diff。若计划执行中扩大首版范围，先回到设计确认。
-- [x] Step 4：运行 `python scripts/verify_public_files.py --tracked`、`git status --short`，确认工作区文件与交付说明一致（本地检查完成；后续推送尚未执行）。待用户审阅后首次 push 工作分支并准备 draft PR；如果远程仍无 main，先用已审阅的基线建立 main，再推工作分支，保留任务历史、不 force push；若 main 已存在则按最新历史对齐。不请求他人 review、不发送外部消息。
+- [x] Step 4：运行 `python scripts/verify_public_files.py --tracked`、`git status --short`，确认工作区文件与交付说明一致。用户审阅后已批准推送：先以 `50f4b40` 建立空仓库 main，再推工作分支并创建 Draft PR #1，保留任务历史、未 force push。不请求他人 review、不发送外部消息。
 - [x] Step 5：本地提交 `docs: record AstroMCP review closure`；若创建 PR，使用具体标题与验证说明，并在当前 chat attach PR。远程 CI 未运行/未通过时不宣布完成生产验证，不自动 merge。
 
 ## 审查发现到任务的追踪
