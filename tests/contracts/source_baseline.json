@@ -1,0 +1,92 @@
+{
+  "k8s-check-mcp/mcp_server.py": {
+    "sha256": "eae21beee71a45c96d151b35dfb433c9d293c1d9d4bac8dff0eeeb7f6a5ff85e",
+    "surface": [
+      {
+        "name": "list_nodes",
+        "decorators": "mcp.tool(annotations={'title': 'List Kubernetes Nodes', 'readOnlyHint': True, 'idempotentHint': True, 'openWorldHint': True})",
+        "args": "label_selector: Annotated[str | None, Field(description='可选的 Kubernetes label selector，例如 node-role.kubernetes.io/worker')]=None"
+      },
+      {
+        "name": "get_node_detail",
+        "decorators": "mcp.tool(annotations={'title': 'Get Node Detail', 'readOnlyHint': True, 'idempotentHint': True, 'openWorldHint': True})",
+        "args": "node_name: Annotated[str, Field(description='节点名称')]"
+      },
+      {
+        "name": "get_node_resource_usage",
+        "decorators": "mcp.tool(annotations={'title': 'Audit Node Resource Usage', 'readOnlyHint': True, 'idempotentHint': True, 'openWorldHint': True})",
+        "args": "node_name: Annotated[str, Field(description='节点名称')]"
+      },
+      {
+        "name": "find_problem_nodes",
+        "decorators": "mcp.tool(annotations={'title': 'Find Problem Nodes', 'readOnlyHint': True, 'idempotentHint': True, 'openWorldHint': True})",
+        "args": "label_selector: Annotated[str | None, Field(description='可选的节点标签过滤条件')]=None"
+      },
+      {
+        "name": "list_node_pods",
+        "decorators": "mcp.tool(annotations={'title': 'List Node Pods', 'readOnlyHint': True, 'idempotentHint': True, 'openWorldHint': True})",
+        "args": "node_name: Annotated[str, Field(description='节点名称')]"
+      },
+      {
+        "name": "diagnose_pod_issues",
+        "decorators": "mcp.tool(annotations={'title': 'Diagnose Pod Issues', 'readOnlyHint': True, 'idempotentHint': True, 'openWorldHint': True})",
+        "args": "pod_name: Annotated[str, Field(description='Pod 名称')], namespace: Annotated[str, Field(description='Pod 所在命名空间')]"
+      },
+      {
+        "name": "health_check",
+        "decorators": "mcp.tool(annotations={'title': 'Health Check', 'readOnlyHint': True, 'idempotentHint': True, 'openWorldHint': True})",
+        "args": ""
+      },
+      {
+        "name": "cluster_summary",
+        "decorators": "mcp.resource('k8s://cluster/summary')",
+        "args": ""
+      },
+      {
+        "name": "node_triage_prompt",
+        "decorators": "mcp.prompt",
+        "args": "node_name: Annotated[str, Field(description='待排查的节点名称')]"
+      },
+      {
+        "name": "cluster_problem_scan_prompt",
+        "decorators": "mcp.prompt",
+        "args": ""
+      }
+    ]
+  },
+  "resource-check-mcp/resource-check-mcp.py": {
+    "sha256": "020e25264cc2262e723ed1baa746464273d3c62d57c953841c955e490a9cc472",
+    "surface": [
+      {
+        "name": "check_host_status",
+        "decorators": "mcp.tool()",
+        "args": "hostname: Annotated[str, Field(description='主机名或 IP 地址')]"
+      },
+      {
+        "name": "check_disk_usage",
+        "decorators": "mcp.tool()",
+        "args": "host: Annotated[str, Field(description='目标主机 IP 或域名（本机传 127.0.0.1）)')]='127.0.0.1', path: Annotated[str, Field(description='要检查的磁盘路径（如 / 或 C:）')]='/', threshold: Annotated[int, Field(description=f'磁盘使用率告警阈值，默认 {DEFAULT_DISK_THRESHOLD}%')]=DEFAULT_DISK_THRESHOLD, username: Annotated[Optional[str], Field(description='SSH 用户名（仅远程需要）')]=None, password: Annotated[Optional[str], Field(description='SSH 密码（仅远程需要）')]=None, key_path: Annotated[Optional[str], Field(description='SSH 私钥路径（仅远程需要）')]=None, port: Annotated[int, Field(description='SSH 端口')]=22"
+      },
+      {
+        "name": "check_mem",
+        "decorators": "mcp.tool()",
+        "args": "host: Annotated[str, Field(description='目标主机 IP 或域名')]='127.0.0.1', username: Annotated[Optional[str], Field(description='SSH 用户名')]=None, password: Annotated[Optional[str], Field(description='SSH 密码')]=None, key_path: Annotated[Optional[str], Field(description='SSH 私钥路径（仅远程需要）')]=None, port: Annotated[int, Field(description='SSH 端口')]=22"
+      },
+      {
+        "name": "check_cpu",
+        "decorators": "mcp.tool()",
+        "args": "host: Annotated[str, Field(description='目标主机 IP 或域名')]='127.0.0.1', username: Annotated[Optional[str], Field(description='SSH 用户名')]=None, password: Annotated[Optional[str], Field(description='SSH 密码')]=None, key_path: Annotated[Optional[str], Field(description='SSH 私钥路径（仅远程需要）')]=None, port: Annotated[int, Field(description='SSH 端口')]=22"
+      },
+      {
+        "name": "check_tcp",
+        "decorators": "mcp.tool()",
+        "args": "host: Annotated[str, Field(description='目标主机 IP 或域名')]='127.0.0.1', username: Annotated[Optional[str], Field(description='SSH 用户名')]=None, password: Annotated[Optional[str], Field(description='SSH 密码')]=None, key_path: Annotated[Optional[str], Field(description='SSH 私钥路径（仅远程需要）')]=None, port: Annotated[int, Field(description='SSH 端口')]=22"
+      },
+      {
+        "name": "check_service_port",
+        "decorators": "mcp.tool()",
+        "args": "host: Annotated[str, Field(description='主机名或 IP 地址')], port: Annotated[int, Field(description='端口号')]"
+      }
+    ]
+  }
+}
