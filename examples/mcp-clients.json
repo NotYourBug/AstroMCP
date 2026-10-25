@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "astromcp-host": {
+      "command": "uv",
+      "args": ["--directory", "TEST_ONLY_ASTROMCP_PATH", "run", "--frozen", "--package", "astromcp-host", "astromcp-host"],
+      "env": {"MCP_SSH_KNOWN_HOSTS": "TEST_ONLY_KNOWN_HOSTS_PATH"}
+    },
+    "astromcp-k8s": {
+      "command": "uv",
+      "args": ["--directory", "TEST_ONLY_ASTROMCP_PATH", "run", "--frozen", "--package", "astromcp-k8s", "astromcp-k8s"],
+      "env": {"MCP_K8S_KUBECONFIG": "TEST_ONLY_KUBECONFIG_PATH"}
+    }
+  }
+}

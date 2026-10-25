@@ -1,0 +1,29 @@
+[project]
+name = "astromcp-workspace"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["k8s-check-mcp", "resource-check-mcp"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "pytest-timeout>=2.3,<3", "ruff>=0.11,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "k8s-check-mcp/tests", "resource-check-mcp/tests"]
+asyncio_mode = "auto"
+timeout = 15
+timeout_method = "thread"
+markers = ["integration: requires explicitly configured external test infrastructure"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = [".superpowers", ".codegraph", ".claude"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]

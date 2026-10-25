@@ -1,0 +1,18 @@
+[project]
+name = "astromcp-k8s"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["fastmcp>=3,<4", "kubernetes>=37,<38", "pydantic>=2,<3"]
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6,<7"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+astromcp-k8s = "k8s_check_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

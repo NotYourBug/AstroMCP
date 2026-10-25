@@ -1,6 +1,6 @@
 # AstroMCP：两个独立 MCP 包的修复与工程化设计
 
-状态：设计草案，待用户审阅。2026-10-25。
+状态：2026-10-25 用户批准（“fine，go ahead”），本会话顺序实施。
 
 ## 1. 已确定的方向与本轮目标
 
@@ -10,7 +10,7 @@
 
 首版目标：使已有 13 个工具、1 个 Resource、2 个 Prompt 在明确范围内可安装、可启动、诊断可信、操作有界，并能通过自动测试维护。修复范围逐项覆盖工作区《MCP代码审查与优化建议.md》的 R1–R9、K1–K9 和部署/文档问题。
 
-首版使用范围由本设计提出，尚待用户确认：本地/单操作者；Windows、Linux 为运行与 CI 环境，macOS 先提供采集解析 fixture 验证。没有真实测试的 SSH 平台或集群版本必须标为未验证。
+用户已批准的首版范围：本地/单操作者；Windows、Linux 为运行与 CI 环境，macOS 先提供采集解析 fixture 验证。没有真实测试的 SSH 平台或集群版本必须标为未验证。
 
 不包含集群/主机写操作、任意命令工具、Web 控制台、通知、报表服务、数据库、多租户 SSO、自建权限平台、SSH 连接池和跨请求指标缓存。后两项只有性能证据支持后再考虑。
 
@@ -50,6 +50,7 @@ MCP/
       resources.py
       diagnostics.py
       presentation.py               # Node/Pod/Event 的输出视图
+      inspector.py                  # 工具编排，保持 server 薄层
       prompts.py
     tests/{unit,integration,fixtures}/
   resource-check-mcp/

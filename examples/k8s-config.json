@@ -1,0 +1,28 @@
+{
+  "transport": "stdio",
+  "bind_host": "127.0.0.1",
+  "bind_port": 8080,
+  "in_cluster": false,
+  "kubeconfig": "TEST_ONLY_KUBECONFIG_PATH",
+  "verify_ssl": true,
+  "connect_timeout_seconds": 3,
+  "read_timeout_seconds": 10,
+  "tool_timeout_seconds": 30,
+  "queue_timeout_seconds": 2,
+  "api_rps": 5,
+  "api_burst": 10,
+  "api_max_in_flight": 3,
+  "rate_limit_enabled": true,
+  "page_size": 200,
+  "max_objects": 10000,
+  "include_logs": true,
+  "thresholds": {
+    "node_cpu_utilization": 0.8,
+    "node_memory_utilization": 0.85,
+    "pod_restart_count": 3,
+    "requests_overcommit_ratio": 1,
+    "limits_overcommit_ratio": 1.5,
+    "pending_seconds": 300,
+    "ready_seconds": 60
+  }
+}

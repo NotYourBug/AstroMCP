@@ -1,0 +1,353 @@
+{
+  "host": {
+    "check_host_status": {
+      "additionalProperties": false,
+      "properties": {
+        "hostname": {
+          "description": "主机名或 IP 地址",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hostname"
+      ],
+      "type": "object"
+    },
+    "check_disk_usage": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "default": "127.0.0.1",
+          "description": "目标主机 IP 或域名（本机传 127.0.0.1）)",
+          "type": "string"
+        },
+        "path": {
+          "default": "/",
+          "description": "要检查的磁盘路径（如 / 或 C:）",
+          "type": "string"
+        },
+        "threshold": {
+          "default": 85,
+          "description": "磁盘使用率告警阈值，默认 85%",
+          "type": "integer"
+        },
+        "username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 用户名（仅远程需要）"
+        },
+        "password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 密码（仅远程需要）"
+        },
+        "key_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 私钥路径（仅远程需要）"
+        },
+        "port": {
+          "default": 22,
+          "description": "SSH 端口",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "check_mem": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "default": "127.0.0.1",
+          "description": "目标主机 IP 或域名",
+          "type": "string"
+        },
+        "username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 用户名"
+        },
+        "password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 密码"
+        },
+        "key_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 私钥路径（仅远程需要）"
+        },
+        "port": {
+          "default": 22,
+          "description": "SSH 端口",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "check_cpu": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "default": "127.0.0.1",
+          "description": "目标主机 IP 或域名",
+          "type": "string"
+        },
+        "username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 用户名"
+        },
+        "password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 密码"
+        },
+        "key_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 私钥路径（仅远程需要）"
+        },
+        "port": {
+          "default": 22,
+          "description": "SSH 端口",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "check_tcp": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "default": "127.0.0.1",
+          "description": "目标主机 IP 或域名",
+          "type": "string"
+        },
+        "username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 用户名"
+        },
+        "password": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 密码"
+        },
+        "key_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SSH 私钥路径（仅远程需要）"
+        },
+        "port": {
+          "default": 22,
+          "description": "SSH 端口",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "check_service_port": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "description": "主机名或 IP 地址",
+          "type": "string"
+        },
+        "port": {
+          "description": "端口号",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host",
+        "port"
+      ],
+      "type": "object"
+    }
+  },
+  "k8s": {
+    "list_nodes": {
+      "additionalProperties": false,
+      "properties": {
+        "label_selector": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "可选的 Kubernetes label selector，例如 node-role.kubernetes.io/worker"
+        }
+      },
+      "type": "object"
+    },
+    "get_node_detail": {
+      "additionalProperties": false,
+      "properties": {
+        "node_name": {
+          "description": "节点名称",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_name"
+      ],
+      "type": "object"
+    },
+    "get_node_resource_usage": {
+      "additionalProperties": false,
+      "properties": {
+        "node_name": {
+          "description": "节点名称",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_name"
+      ],
+      "type": "object"
+    },
+    "find_problem_nodes": {
+      "additionalProperties": false,
+      "properties": {
+        "label_selector": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "可选的节点标签过滤条件"
+        }
+      },
+      "type": "object"
+    },
+    "list_node_pods": {
+      "additionalProperties": false,
+      "properties": {
+        "node_name": {
+          "description": "节点名称",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_name"
+      ],
+      "type": "object"
+    },
+    "diagnose_pod_issues": {
+      "additionalProperties": false,
+      "properties": {
+        "pod_name": {
+          "description": "Pod 名称",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "Pod 所在命名空间",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pod_name",
+        "namespace"
+      ],
+      "type": "object"
+    },
+    "health_check": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  }
+}
