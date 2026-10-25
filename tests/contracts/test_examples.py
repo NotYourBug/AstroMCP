@@ -34,6 +34,13 @@ def test_client_commands_and_migration_documented():
         name = "astromcp-" + kind
         assert clients["mcpServers"][name]["args"][-1] == name
         assert name in readme
-    compatibility = (ROOT / "docs/compatibility.md").read_text(encoding="utf-8")
-    for term in ("known_hosts", "loopback", "continue_token", "coverage_scope", "node_count"):
-        assert term in compatibility
+        folder = ROOT / ("resource-check-mcp" if kind == "host" else "k8s-check-mcp")
+        assert name in (folder / "README.md").read_text(encoding="utf-8")
+        compatibility = (folder / "compatibility.md").read_text(encoding="utf-8")
+        terms = (
+            ("known_hosts", "loopback")
+            if kind == "host"
+            else ("loopback", "continue_token", "coverage_scope", "node_count")
+        )
+        for term in terms:
+            assert term in compatibility
