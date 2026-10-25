@@ -12,6 +12,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -344,6 +345,151 @@ def _err(host: str, error: str, **extra) -> dict:
     return result
 
 
+_LOCAL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="astromcp-local")
+_LOCAL_SEM = threading.BoundedSemaphore(4)
+
+
+async def _local_call(fn, *args, **kwargs):
+    deadline = _TOOL_DEADLINE.get() or time.monotonic()+30
+    queue_end = min(deadline, time.monotonic()+2)
+    while not _LOCAL_SEM.acquire(blocking=False):
+        if time.monotonic() >= queue_end:
+            raise TimeoutError("BUSY")
+        await asyncio.sleep(.005)
+    future = _LOCAL_POOL.submit(fn, *args, **kwargs)
+    future.add_done_callback(lambda _: _LOCAL_SEM.release())
+    wrapped = asyncio.wrap_future(future)
+    wrapped.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+    return await asyncio.wait_for(asyncio.shield(wrapped), max(deadline-time.monotonic(), .001))
+
+
+def _percent(value):
+    value = float(value)
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        raise ValueError("invalid utilization")
+    return round(value, 1)
+
+
+def _memory_fields(total, available):
+    total, available = int(total), int(available)
+    if total <= 0 or not 0 <= available <= total:
+        raise ValueError("invalid capacity")
+    return {"total_gb": round(total/1024**3, 2), "used_gb": round((total-available)/1024**3, 2),
+            "free_gb": round(available/1024**3, 2), "percent": _percent((total-available)/total*100)}
+
+
+def parse_cpu_linux(text: str) -> float:
+    parts = text.strip().splitlines()[-1].split()
+    if len(parts) < 15:
+        raise ValueError("vmstat fields missing")
+    return _percent(100-float(parts[14]))
+
+
+def parse_cpu_mac(text: str) -> float:
+    samples = re.findall(r"([\d.]+)%\s+idle", text)
+    if not samples:
+        raise ValueError("top idle field missing")
+    return _percent(100-float(samples[-1]))
+
+
+def parse_cpu_windows(text: str) -> float:
+    data = json.loads(text)
+    items = data if isinstance(data, list) else [data]
+    if not items or any(not isinstance(item, dict) or item.get("LoadPercentage") is None for item in items):
+        raise ValueError("LoadPercentage missing")
+    return _percent(sum(_percent(item["LoadPercentage"]) for item in items)/len(items))
+
+
+def parse_memory_linux(text: str) -> dict:
+    line = next((line for line in text.splitlines() if line.lstrip().startswith("Mem:")), "")
+    parts = line.split()
+    if len(parts) < 7:
+        raise ValueError("free available field missing")
+    return _memory_fields(parts[1], parts[6])
+
+
+def parse_memory_mac(text: str) -> dict:
+    lines = text.splitlines()
+    total = int(lines[0])
+    match = re.search(r"([\d.]+)([GMK]?)\s+unused", text)
+    if not match:
+        raise ValueError("PhysMem unused field missing")
+    free = float(match[1])*{"G":1024**3,"M":1024**2,"K":1024,"":1}[match[2]]
+    return {**_memory_fields(total, free), "memory_basis": "macOS PhysMem unused; not Linux MemAvailable"}
+
+
+def parse_memory_windows(text: str) -> dict:
+    data = json.loads(text)
+    if not isinstance(data, dict) or any(data.get(key) is None for key in ("TotalVisibleMemorySize", "FreePhysicalMemory")):
+        raise ValueError("memory fields missing")
+    return _memory_fields(int(data["TotalVisibleMemorySize"])*1024, int(data["FreePhysicalMemory"])*1024)
+
+
+def parse_disk_unix(text: str) -> dict:
+    match = re.fullmatch(r".+?\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)%\s+.+", text.strip().splitlines()[-1])
+    if not match:
+        raise ValueError("df fields missing")
+    total, used, free = (int(match[i])*1024 for i in (1,2,3))
+    if total <= 0 or min(used, free) < 0 or used > total:
+        raise ValueError("invalid disk capacity")
+    return {"total_gb":round(total/1024**3,2),"used_gb":round(used/1024**3,2),
+            "free_gb":round(free/1024**3,2),"percent":_percent(match[4])}
+
+
+def parse_disk_windows(text: str) -> dict:
+    data = json.loads(text)
+    if not isinstance(data, dict) or any(data.get(key) is None for key in ("Size", "SizeRemaining")):
+        raise ValueError("volume fields missing")
+    return _memory_fields(data["Size"], data["SizeRemaining"])
+
+
+def parse_tcp_output(text: str) -> int:
+    if not text.strip():
+        raise ValueError("empty netstat output")
+    lines = text.splitlines()
+    rows = [line for line in lines if line.split() and line.split()[0].lower() in {"tcp", "tcp4", "tcp6"}]
+    if not rows and not any(word in text.lower() for word in ("proto", "active", "活动连接")):
+        raise ValueError("unrecognized netstat output")
+    return len(rows)
+
+
+async def _collect_remote(metric, os_type, host, port, username, password, key_path, path=None, threshold=85):
+    commands = {
+        ("cpu","linux"):"LC_ALL=C vmstat 1 2", ("cpu","mac"):"LC_ALL=C top -l 2 -s 1",
+        ("memory","linux"):"LC_ALL=C free -b", ("memory","mac"):"LC_ALL=C top -l 1 -s 0",
+        ("tcp","linux"):"LC_ALL=C netstat -an", ("tcp","mac"):"LC_ALL=C netstat -an",
+        ("tcp","windows"):"netstat -ano",
+        ("cpu","windows"):'powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Select-Object LoadPercentage | ConvertTo-Json"',
+        ("memory","windows"):'powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json"',
+    }
+    prefix = ""
+    if metric == "memory" and os_type == "mac":
+        code, prefix, err = await run_remote_command(host,port,username,password,key_path,"sysctl -n hw.memsize")
+        if code != 0:
+            return _err(host,"Cannot collect macOS capacity",error_code="COMMAND_FAILED")
+    command = (build_windows_disk_command(path) if os_type=="windows" else build_unix_disk_command(path)) if metric=="disk" else commands[(metric,os_type)]
+    code, out, err = await run_remote_command(host,port,username,password,key_path,command)
+    if code != 0:
+        known = {"TIMEOUT","BUSY","AUTH_FAILED","HOST_KEY_UNKNOWN","HOST_KEY_CHANGED","UNREACHABLE","OUTPUT_LIMIT","INVALID_INPUT"}
+        error_code = err if err in known else "COMMAND_FAILED"
+        return _err(host,"Remote collection failed",error_code=error_code)
+    try:
+        if metric == "cpu":
+            parser = {"linux":parse_cpu_linux,"mac":parse_cpu_mac,"windows":parse_cpu_windows}[os_type]
+            data = {"percent":parser(out), "sample_window_seconds":1}
+        elif metric == "memory":
+            parser = {"linux":parse_memory_linux,"mac":parse_memory_mac,"windows":parse_memory_windows}[os_type]
+            data = parser(prefix+"\n"+out if prefix else out)
+        elif metric == "disk":
+            data = (parse_disk_windows if os_type=="windows" else parse_disk_unix)(out)
+            data.update(path=path,threshold=threshold,warning=data["percent"]>threshold)
+        else:
+            data = {"tcp_count":parse_tcp_output(out)}
+        return _ok(host=host,**data)
+    except (ValueError, TypeError, KeyError, IndexError):
+        return _err(host,"Collector output did not match the expected format",error_code="PARSE_ERROR")
+
+
 async def run_remote_command(host, port, username, password, key_path, command) -> tuple[int, str, str]:
     global _EXECUTOR
     if _EXECUTOR is None:
@@ -465,7 +611,7 @@ async def check_disk_usage(
     # ---- 本地 ----
     if is_local(host):
         try:
-            usage = psutil.disk_usage(path)
+            usage = await _local_call(psutil.disk_usage, path)
             return _ok(
                 host=host,
                 path=path,
@@ -496,68 +642,11 @@ async def check_disk_usage(
 
 
 async def _disk_unix(host, port, username, password, key_path, path, threshold) -> dict:
-    """Unix (Linux/macOS) 磁盘检查 — 使用 df -kP"""
-    status, out, err = await run_remote_command(
-        host, port, username, password, key_path, build_unix_disk_command(path)
-    )
-    if status != 0:
-        return _err(host, "执行 df 命令失败", detail=err or out)
-
-    lines = out.strip().split("\n")
-    if len(lines) < 2:
-        return _err(host, "df 输出异常", raw=out)
-
-    # df -kP 格式: Filesystem 1024-blocks Used Available Capacity Mounted on
-    # 挂载点可能含空格，所以用从右向左的解析策略
-    parts = lines[-1].split()
-    if len(parts) < 5:
-        return _err(host, "解析 df 输出失败 — 字段不足", raw=out)
-
-    try:
-        total_kb = int(parts[1])
-        used_kb = int(parts[2])
-        free_kb = int(parts[3])
-        pct = float(parts[4].rstrip("%"))
-        return _ok(
-            host=host,
-            path=path,
-            total_gb=round(total_kb / (1024**2), 2),
-            used_gb=round(used_kb / (1024**2), 2),
-            free_gb=round(free_kb / (1024**2), 2),
-            percent=pct,
-            threshold=threshold,
-            warning=pct > threshold,
-        )
-    except (ValueError, IndexError) as e:
-        return _err(host, f"解析 df 输出失败: {e}", raw=out)
+    return await _collect_remote("disk","linux",host,port,username,password,key_path,path,threshold)
 
 
 async def _disk_windows(host, port, username, password, key_path, path, threshold) -> dict:
-    """Windows 磁盘检查 — 使用 PowerShell Get-Volume"""
-    cmd = build_windows_disk_command(path)
-    drive = path[0].upper()
-    status, out, err = await run_remote_command(host, port, username, password, key_path, cmd)
-    if status != 0:
-        return _err(host, "执行 PowerShell Get-Volume 失败", detail=err or out)
-
-    try:
-        data = json.loads(out)
-        total = data.get("Size", 0) or 0
-        free = data.get("SizeRemaining", 0) or 0
-        used = total - free
-        pct = round((used / total) * 100, 1) if total > 0 else 0
-        return _ok(
-            host=host,
-            path=f"{drive}:",
-            total_gb=round(total / (1024**3), 2),
-            used_gb=round(used / (1024**3), 2),
-            free_gb=round(free / (1024**3), 2),
-            percent=pct,
-            threshold=threshold,
-            warning=pct > threshold,
-        )
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        return _err(host, f"解析 PowerShell 输出失败: {e}", raw=out)
+    return await _collect_remote("disk","windows",host,port,username,password,key_path,path,threshold)
 
 
 @mcp.tool()
@@ -576,7 +665,7 @@ async def check_mem(
 
     if is_local(host):
         try:
-            mem = psutil.virtual_memory()
+            mem = await _local_call(psutil.virtual_memory)
             return _ok(
                 host=host,
                 total_gb=round(mem.total / (1024**3), 2),
@@ -606,124 +695,15 @@ async def _mem_remote(os_type, host, port, username, password, key_path) -> dict
 
 
 async def _mem_linux(host, port, username, password, key_path) -> dict:
-    """Linux 内存 — free -b"""
-    status, out, err = await run_remote_command(
-        host, port, username, password, key_path, "free -b"
-    )
-    if status != 0:
-        return _err(host, "执行 free 命令失败", detail=err or out)
-
-    lines = out.strip().split("\n")
-    if len(lines) < 2:
-        return _err(host, "free 输出异常", raw=out)
-
-    parts = lines[1].split()
-    try:
-        total = int(parts[1])
-        used = int(parts[2])
-        available = int(parts[6]) if len(parts) > 6 else (total - used)
-        pct = round((total - available) / total * 100, 1) if total > 0 else 0
-        return _ok(
-            host=host,
-            total_gb=round(total / (1024**3), 2),
-            used_gb=round((total - available) / (1024**3), 2),
-            free_gb=round(available / (1024**3), 2),
-            percent=pct,
-        )
-    except (ValueError, IndexError, ZeroDivisionError) as e:
-        return _err(host, f"解析 free 输出失败: {e}", raw=out)
+    return await _collect_remote("memory","linux",host,port,username,password,key_path)
 
 
 async def _mem_mac(host, port, username, password, key_path) -> dict:
-    """macOS 内存 — sysctl + top"""
-    # 获取总内存
-    status, out, err = await run_remote_command(
-        host, port, username, password, key_path, "sysctl -n hw.memsize"
-    )
-    if status != 0:
-        return _err(host, "获取 macOS 总内存失败", detail=err or out)
-
-    try:
-        total = int(out.strip())
-    except ValueError:
-        return _err(host, "解析 sysctl hw.memsize 失败", raw=out)
-
-    # 获取使用情况 — 用 top 的 PhysMem 行
-    status, out, err = await run_remote_command(
-        host, port, username, password, key_path, "top -l 1 -s 0 | grep PhysMem"
-    )
-    if status != 0 or not out:
-        # 退化：只返回总内存
-        return _ok(
-            host=host,
-            total_gb=round(total / (1024**3), 2),
-            used_gb=None,
-            free_gb=None,
-            percent=None,
-            note="macOS 实时内存详情获取失败，仅返回总容量",
-        )
-
-    # PhysMem 格式: "PhysMem: 16G used (2.4G wired), 16G unused."
-    m_used = re.search(r"PhysMem:\s*(\S+)\s+used", out)
-    m_unused = re.search(r"(\S+)\s+unused", out)
-
-    def _parse_mem_str(s: str) -> int:
-        """将 '16G' / '512M' / '1.5G' 转换为字节"""
-        s = s.strip().upper()
-        if s.endswith("G"):
-            return int(float(s[:-1]) * (1024**3))
-        elif s.endswith("M"):
-            return int(float(s[:-1]) * (1024**2))
-        elif s.endswith("K"):
-            return int(float(s[:-1]) * 1024)
-        else:
-            return int(float(s))
-
-    if m_used and m_unused:
-        try:
-            used = _parse_mem_str(m_used.group(1))
-            free = _parse_mem_str(m_unused.group(1))
-            pct = round((used / total) * 100, 1) if total > 0 else 0
-            return _ok(
-                host=host,
-                total_gb=round(total / (1024**3), 2),
-                used_gb=round(used / (1024**3), 2),
-                free_gb=round(free / (1024**3), 2),
-                percent=pct,
-            )
-        except ValueError as e:
-            return _err(host, f"解析 macOS PhysMem 失败: {e}", raw=out)
-
-    return _err(host, "解析 macOS PhysMem 失败 — 无法匹配格式", raw=out)
+    return await _collect_remote("memory","mac",host,port,username,password,key_path)
 
 
 async def _mem_windows(host, port, username, password, key_path) -> dict:
-    """Windows 内存 — Get-CimInstance（wmic 的现代替代）"""
-    cmd = (
-        'powershell -NoProfile -Command "'
-        "Get-CimInstance Win32_OperatingSystem | "
-        "Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json\""
-    )
-    status, out, err = await run_remote_command(host, port, username, password, key_path, cmd)
-    if status != 0:
-        return _err(host, "执行 Get-CimInstance 失败", detail=err or out)
-
-    try:
-        data = json.loads(out)
-        # WMI 返回的值为 KB
-        total = (data.get("TotalVisibleMemorySize", 0) or 0) * 1024
-        free = (data.get("FreePhysicalMemory", 0) or 0) * 1024
-        used = total - free
-        pct = round((used / total) * 100, 1) if total > 0 else 0
-        return _ok(
-            host=host,
-            total_gb=round(total / (1024**3), 2),
-            used_gb=round(used / (1024**3), 2),
-            free_gb=round(free / (1024**3), 2),
-            percent=pct,
-        )
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        return _err(host, f"解析 Windows 内存信息失败: {e}", raw=out)
+    return await _collect_remote("memory","windows",host,port,username,password,key_path)
 
 
 @mcp.tool()
@@ -742,7 +722,7 @@ async def check_cpu(
 
     if is_local(host):
         try:
-            return _ok(host=host, percent=psutil.cpu_percent(interval=1))
+            return _ok(host=host, percent=await _local_call(psutil.cpu_percent, interval=1), sample_window_seconds=1)
         except Exception as e:
             logger.exception("本地 CPU 检查失败")
             return _err(host, f"本地 CPU 检查失败: {e}")
@@ -765,51 +745,15 @@ async def _cpu_remote(os_type, host, port, username, password, key_path) -> dict
 
 
 async def _cpu_linux(host, port, username, password, key_path) -> dict:
-    """Linux CPU — vmstat"""
-    cmd = "vmstat 1 2 | tail -1 | awk '{print 100 - $15}'"
-    status, out, err = await run_remote_command(host, port, username, password, key_path, cmd)
-    if status != 0:
-        return _err(host, "获取 Linux CPU 使用率失败", detail=err or out)
-    try:
-        return _ok(host=host, percent=float(out.strip()))
-    except ValueError:
-        return _err(host, "解析 vmstat 输出失败", raw=out)
+    return await _collect_remote("cpu","linux",host,port,username,password,key_path)
 
 
 async def _cpu_mac(host, port, username, password, key_path) -> dict:
-    """macOS CPU — top"""
-    cmd = "top -l 1 | awk '/^CPU usage/ {print $3}' | sed 's/%//'"
-    status, out, err = await run_remote_command(host, port, username, password, key_path, cmd)
-    if status != 0:
-        return _err(host, "获取 macOS CPU 使用率失败", detail=err or out)
-    try:
-        return _ok(host=host, percent=float(out.strip()))
-    except ValueError:
-        return _err(host, "解析 top 输出失败", raw=out)
+    return await _collect_remote("cpu","mac",host,port,username,password,key_path)
 
 
 async def _cpu_windows(host, port, username, password, key_path) -> dict:
-    """Windows CPU — Get-CimInstance（wmic 的现代替代）"""
-    cmd = (
-        'powershell -NoProfile -Command "'
-        "Get-CimInstance Win32_Processor | "
-        "Select-Object LoadPercentage | ConvertTo-Json\""
-    )
-    status, out, err = await run_remote_command(host, port, username, password, key_path, cmd)
-    if status != 0:
-        return _err(host, "获取 Windows CPU 使用率失败", detail=err or out)
-
-    try:
-        data = json.loads(out)
-        # Get-CimInstance 可能返回单个对象或数组
-        if isinstance(data, list):
-            percentages = [item.get("LoadPercentage", 0) or 0 for item in data]
-            avg_pct = sum(percentages) / len(percentages) if percentages else 0
-        else:
-            avg_pct = data.get("LoadPercentage", 0) or 0
-        return _ok(host=host, percent=round(float(avg_pct), 1))
-    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-        return _err(host, f"解析 Windows CPU 信息失败: {e}", raw=out)
+    return await _collect_remote("cpu","windows",host,port,username,password,key_path)
 
 
 @mcp.tool()
@@ -828,7 +772,7 @@ async def check_tcp(
 
     if is_local(host):
         try:
-            conns = [c for c in psutil.net_connections(kind="tcp")]
+            conns = await _local_call(psutil.net_connections, kind="tcp")
             return _ok(host=host, tcp_count=len(conns))
         except psutil.AccessDenied:
             return _err(host, "本地权限不足，无法获取完整 TCP 连接数")
@@ -844,22 +788,7 @@ async def check_tcp(
 
 
 async def _tcp_remote(os_type, host, port, username, password, key_path) -> dict:
-    """远程 TCP 连接数采集分发"""
-    if os_type in ("linux", "mac"):
-        cmd = "netstat -an | grep -i tcp | wc -l"
-    else:
-        cmd = 'netstat -ano | find /c "TCP"'
-
-    status, out, err = await run_remote_command(
-        host, port, username, password, key_path, cmd
-    )
-    if status != 0:
-        return _err(host, "获取 TCP 连接数失败", detail=err or out)
-
-    try:
-        return _ok(host=host, tcp_count=int(out.strip()))
-    except ValueError:
-        return _err(host, "解析 TCP 连接数失败", raw=out)
+    return await _collect_remote("tcp",os_type,host,port,username,password,key_path)
 
 
 @mcp.tool()
