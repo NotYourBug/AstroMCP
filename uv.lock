@@ -289,7 +289,7 @@ wheels = [
 [[package]]
 name = "astromcp-host"
 version = "0.1.0"
-source = { virtual = "resource-check-mcp" }
+source = { editable = "resource-check-mcp" }
 dependencies = [
     { name = "fastmcp" },
     { name = "paramiko" },

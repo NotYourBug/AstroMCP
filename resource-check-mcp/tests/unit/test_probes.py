@@ -1,3 +1,4 @@
+import resource_check_mcp.config as host_config
 import asyncio
 import socket
 from unittest.mock import AsyncMock, Mock
@@ -7,7 +8,7 @@ import pytest
 
 @pytest.mark.parametrize("error,code,open_value", [(ConnectionRefusedError(),None,False),(socket.gaierror(),"DNS_ERROR",None),(TimeoutError(),"TIMEOUT",None)])
 async def test_tcp_failure_types(legacy_module,monkeypatch,error,code,open_value):
-    m=legacy_module("host")
+    import resource_check_mcp.probes as m
     monkeypatch.setattr(asyncio,"open_connection",AsyncMock(side_effect=error))
     result=await m.probe_tcp("example.test",80,timeout=.05)
     assert result["open"] is open_value
@@ -16,7 +17,7 @@ async def test_tcp_failure_types(legacy_module,monkeypatch,error,code,open_value
 
 
 async def test_ipv6_probe(legacy_module,monkeypatch):
-    m=legacy_module("host")
+    import resource_check_mcp.probes as m
     writer=Mock(wait_closed=AsyncMock())
     connect=AsyncMock(return_value=(None,writer))
     monkeypatch.setattr(asyncio,"open_connection",connect)
@@ -28,4 +29,4 @@ async def test_ipv6_probe(legacy_module,monkeypatch):
 
 @pytest.mark.parametrize("host",["-n", "host\nwhoami", "host name"])
 def test_host_options_rejected(legacy_module,host):
-    assert legacy_module("host")._check_host(host) is not None
+    assert host_config._check_host(host) is not None

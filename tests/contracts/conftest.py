@@ -10,6 +10,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def load_server_module(kind):
+    if kind == "host":
+        from types import SimpleNamespace
+        from resource_check_mcp.server import create_server
+        return SimpleNamespace(mcp=create_server())
     paths = {"host": "resource-check-mcp/resource-check-mcp.py", "k8s": "k8s-check-mcp/mcp_server.py"}
     name = f"baseline_{kind}"
     if name not in sys.modules:

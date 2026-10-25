@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 
 
 async def test_ping_timeout_reaps_child(legacy_module,monkeypatch):
-    m=legacy_module("host")
+    import resource_check_mcp.probes as m
     class Process:
         returncode=None
         killed=False

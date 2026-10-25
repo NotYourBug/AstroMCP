@@ -4,7 +4,7 @@ import paramiko
 
 
 def test_load_known_hosts_and_reject_unknown(legacy_module, monkeypatch):
-    module = legacy_module("host")
+    import resource_check_mcp.ssh as module
     client = Mock()
     monkeypatch.setattr(module.paramiko, "SSHClient", lambda: client)
     settings = module.load_settings({})

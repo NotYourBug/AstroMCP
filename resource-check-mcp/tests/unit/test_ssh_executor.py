@@ -32,7 +32,7 @@ class SSHClient:
 
 
 async def test_drains_both_streams_before_exit(legacy_module):
-    m = legacy_module("host")
+    import resource_check_mcp.ssh as m
     channel = Channel(out=b"a" * 100000, err=b"b" * 100000)
     client = SSHClient(channel)
     executor = m.SSHExecutor(m.load_settings({}), client_factory=lambda: client)
@@ -46,7 +46,7 @@ async def test_drains_both_streams_before_exit(legacy_module):
 
 @pytest.mark.parametrize("mode,code", [("limit", "OUTPUT_LIMIT"), ("timeout", "TIMEOUT")])
 async def test_output_and_deadline_bounds(legacy_module, mode, code):
-    m=legacy_module("host")
+    import resource_check_mcp.ssh as m
     channel=Channel(out=b"a"*100 if mode=="limit" else b"", err=b"", done=mode=="limit")
     client=SSHClient(channel)
     settings=m.load_settings({"MCP_SSH_OUTPUT_LIMIT_BYTES":"10"})
@@ -60,7 +60,7 @@ async def test_output_and_deadline_bounds(legacy_module, mode, code):
 async def test_twenty_requests_respect_limits(legacy_module):
     import asyncio
     import threading
-    m=legacy_module("host")
+    import resource_check_mcp.ssh as m
     lock=threading.Lock()
     active={"all":0,"peak":0,"targets":{},"target_peak":0}
     class CountingClient(SSHClient):

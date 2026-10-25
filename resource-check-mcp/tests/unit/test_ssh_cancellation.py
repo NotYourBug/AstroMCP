@@ -6,7 +6,7 @@ from test_ssh_executor import Channel, SSHClient
 
 
 async def test_cancel_retains_permit_until_worker_exits(legacy_module):
-    m=legacy_module("host")
+    import resource_check_mcp.ssh as m
     started, release=threading.Event(),threading.Event()
     class SlowClient(SSHClient):
         def connect(self, **kwargs):
