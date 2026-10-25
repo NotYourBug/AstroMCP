@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio, socket, platform, locale
+from typing import Optional
 from .models import _ok, _err
 from .config import _check_host, _check_port
 

@@ -3,11 +3,12 @@ from __future__ import annotations
 import json, re, ipaddress
 from pathlib import Path
 from collections.abc import Mapping
+from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 HOST_FORBIDDEN = re.compile(r"[;&|`$(){}\[\]<>\"']")
 class HostSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     tool_timeout_seconds: float = Field(default=30, gt=0)
     queue_timeout_seconds: float = Field(default=2, ge=0)
     ssh_connect_timeout_seconds: float = Field(default=8, gt=0)

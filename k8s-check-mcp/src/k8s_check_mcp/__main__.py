@@ -11,6 +11,8 @@ def main(argv=None, *, default_transport='stdio'):
     parser.add_argument('--host', default=settings.bind_host)
     parser.add_argument('--port', type=int, default=settings.bind_port)
     args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        raise ValueError("Port must be between 1 and 65535")
     logging.basicConfig(level=logging.INFO)
     mcp=create_server(settings)
     if args.transport != 'stdio':
