@@ -1,3 +1,4 @@
+from k8s_check_mcp import client as m
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -6,7 +7,6 @@ import pytest
 
 
 def test_gateway_supplies_timeout_and_closes(legacy_module):
-    m=legacy_module("k8s")
     api=Mock(return_value="ok")
     clients=SimpleNamespace(api_client=Mock())
     gateway=m.K8sGateway(m.load_settings({}),client_factory=lambda:clients)
@@ -19,7 +19,6 @@ def test_gateway_supplies_timeout_and_closes(legacy_module):
 
 
 def test_no_request_after_deadline(legacy_module):
-    m=legacy_module("k8s")
     api=Mock()
     gateway=m.K8sGateway(m.load_settings({}))
     with pytest.raises(m.K8sOperationError):gateway.call(api,deadline=time.monotonic()-1)

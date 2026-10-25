@@ -1,5 +1,5 @@
+from k8s_check_mcp import resources as m
 def test_no_best_effort_eviction_advice(legacy_module):
-    m=legacy_module('k8s')
     advice=m.resource_advice([{'name':'heavy','cpu_request_m':2000,'memory_request_bytes':0},
                               {'name':'besteffort','cpu_request_m':0,'memory_request_bytes':0}],{'requests_overcommit':True})
     assert 'heavy' in ' '.join(advice)

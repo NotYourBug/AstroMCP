@@ -11,6 +11,10 @@ ROOT = Path(__file__).parent
 
 
 def load_module(kind):
+    if kind == "k8s":
+        from types import SimpleNamespace
+        from k8s_check_mcp.server import create_server
+        return SimpleNamespace(mcp=create_server())
     if kind == "host":
         from types import SimpleNamespace
         from resource_check_mcp.server import create_server

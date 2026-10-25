@@ -1,3 +1,6 @@
+from k8s_check_mcp.client import K8sGateway
+from k8s_check_mcp.config import load_settings
+from k8s_check_mcp import resources as m
 import json
 import time
 from types import SimpleNamespace as N
@@ -17,7 +20,6 @@ def container(cpu,sidecar=False,limit=None):
     ([container('100m',True),container('200m',True),container('700m')],'500m','100m',1100),
 ])
 def test_effective_resources(legacy_module,inits,app,overhead,expected):
-    m=legacy_module('k8s')
     pod={'spec':{'containers':[container(app)],'initContainers':inits,'overhead':{'cpu':overhead}}}
     result=m.effective_resources(pod)
     assert result.cpu_request_m==expected
@@ -26,19 +28,17 @@ def test_effective_resources(legacy_module,inits,app,overhead,expected):
 
 
 def test_pod_level_and_resize_are_explicitly_unsupported(legacy_module):
-    m=legacy_module('k8s')
     pod={'spec':{'containers':[container('500m')],'resources':{'requests':{'cpu':'1'}}}}
     result=m.effective_resources(pod)
     assert not result.complete and 'UNSUPPORTED_RESOURCE_MODEL' in result.warnings
 
 
 def test_raw_response_survives_sdk_field_loss(legacy_module):
-    m=legacy_module('k8s')
     raw={'spec':{'containers':[container('500m')],'resources':{'requests':{'cpu':'1'}}}}
     response=N(data=json.dumps(raw).encode(),release_conn=Mock())
     clients=N(api_client=Mock())
     clients.api_client.deserialize.return_value=N(spec=N(containers=[],init_containers=[],overhead={}))
-    gateway=m.K8sGateway(m.load_settings({}),client_factory=lambda:clients)
+    gateway=K8sGateway(load_settings({}),client_factory=lambda:clients)
     def read_namespaced_pod(**kwargs):return response
     result=gateway.call(read_namespaced_pod,deadline=time.monotonic()+1)
     assert not m.effective_resources(result).complete
