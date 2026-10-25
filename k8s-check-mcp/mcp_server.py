@@ -207,6 +207,30 @@ def init_k8s_client(settings=None) -> MCPKubeClients:
                           api_client,client.CoreV1Api(api_client),client.CustomObjectsApi(api_client))
 
 
+@dataclass
+class PageResult:
+    items: list[Any]
+    continue_token: str | None = None
+    complete: bool = True
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MetricsSnapshot:
+    usage_by_node: dict
+    observed_at: datetime
+    available: bool = True
+    error_code: str | None = None
+    complete: bool = True
+    warnings: list[str] = field(default_factory=list)
+
+
+def _page_parts(page):
+    if isinstance(page,dict):
+        return page.get("items",[]), page.get("metadata",{}).get("continue")
+    return page.items, getattr(getattr(page,"metadata",None),"_continue",None)
+
+
 class K8sGateway:
     def __init__(self, settings: K8sSettings, *, client_factory=None, clock=time.monotonic):
         self.settings, self.clock = settings, clock
@@ -244,6 +268,54 @@ class K8sGateway:
             raise K8sOperationError("UNREACHABLE", "Kubernetes API unavailable") from None
         finally:
             self.limiter.release()
+
+    def iter_pages(self, fn, *, deadline, **kwargs):
+        token, seen, count = None, set(), 0
+        while True:
+            try:
+                page = self.call(fn,deadline=deadline,limit=self.settings.page_size,_continue=token,**kwargs)
+            except K8sOperationError as exc:
+                _mark_incomplete(exc.code)
+                yield PageResult([],None,False,[exc.code])
+                return
+            items, next_token = _page_parts(page)
+            if next_token and next_token in seen:
+                _mark_incomplete("Repeated API continuation token")
+                yield PageResult([],None,False,["Repeated API continuation token"])
+                return
+            remaining = self.settings.max_objects-count
+            if len(items)>remaining or (len(items)==remaining and next_token):
+                _mark_incomplete("API object limit reached")
+                yield PageResult(list(items[:remaining]),None,False,["API object limit reached"])
+                return
+            yield PageResult(list(items),next_token)
+            count += len(items)
+            if not next_token:
+                return
+            seen.add(next_token)
+            token = next_token
+
+    def fetch_metrics(self, *, deadline):
+        observed = datetime.now(timezone.utc)
+        try:
+            obj = self.call(self.clients.custom.list_cluster_custom_object,deadline=deadline,
+                            group="metrics.k8s.io",version="v1beta1",plural="nodes")
+        except K8sOperationError as exc:
+            _mark_incomplete("Node metrics unavailable: "+exc.code)
+            return MetricsSnapshot({},observed,False,exc.code,False,[exc.code])
+        if not isinstance(obj,dict) or not isinstance(obj.get("items"),list):
+            _mark_incomplete("Node metrics malformed")
+            return MetricsSnapshot({},observed,False,"PARSE_ERROR",False,["PARSE_ERROR"])
+        usage={}
+        complete=len(obj["items"])<=self.settings.max_objects
+        for item in obj["items"][:self.settings.max_objects]:
+            if not isinstance(item,dict) or not isinstance(item.get("metadata"),dict) or not isinstance(item.get("usage"),dict):
+                complete=False
+                continue
+            name=item["metadata"].get("name")
+            if isinstance(name,str):usage[name]=item["usage"]
+        if not complete:_mark_incomplete("Node metrics incomplete or object limit reached")
+        return MetricsSnapshot(usage,observed,True,None,complete,[] if complete else ["Metrics incomplete"])
 
     def close(self):
         with self._lock:
@@ -284,7 +356,7 @@ def _mark_incomplete(warning):
     coverage = _COVERAGE.get()
     if coverage is not None:
         coverage["complete"] = False
-        if warning not in coverage["warnings"]:
+        if warning not in coverage["warnings"] and len(coverage["warnings"])<20:
             coverage["warnings"].append(warning)
 
 
@@ -304,6 +376,8 @@ def _k8s_tool(fn):
             except config.ConfigException:
                 result = {"ok":False,"error":"Kubernetes configuration is unavailable","error_code":"CONFIG_ERROR","complete":False}
             result.setdefault("ok","error" not in result)
+            if fn.__name__ == "health_check" and not result["ok"]:
+                result["status"] = "unhealthy"
             result["complete"] = result.get("complete",True) and coverage["complete"]
             result["warnings"] = list(dict.fromkeys(result.get("warnings",[])+coverage["warnings"]))
             result.update(request_id=request_id,timestamp=datetime.now(timezone.utc).isoformat())
@@ -491,26 +565,9 @@ def _parse_node(node: client.V1Node) -> dict[str, Any]:
     }
 
 
-def _active_pods_on_node(core: client.CoreV1Api, node_name: str) -> list[client.V1Pod]:
-    """
-    只统计已调度到节点上、且非终态的 Pod。
-
-    这样更接近“当前占用该节点调度资源”的视角。
-    """
-
-    pods = _k8s_api_call(
-        core.list_pod_for_all_namespaces,
-        field_selector=f"spec.nodeName={node_name}",
-        watch=False,
-    ).items
-    out: list[client.V1Pod] = []
-    for pod in pods:
-        phase = pod.status.phase if pod.status else ""
-        # 终态 Pod（Succeeded/Failed）不再占用调度资源，资源审计时可以排除。
-        if phase in {"Succeeded", "Failed"}:
-            continue
-        out.append(pod)
-    return out
+def _active_pods_on_node(core, node_name):
+    pods, _ = _collect_api_items(core.list_pod_for_all_namespaces,field_selector=f"spec.nodeName={node_name}",watch=False)
+    return [pod for pod in pods if getattr(pod.status,"phase",None) not in {"Succeeded","Failed"}]
 
 
 def _sum_container_resources(containers: list[Any]) -> tuple[int, int, int, int]:
@@ -598,61 +655,27 @@ def _pod_basic_view(pod: client.V1Pod) -> dict[str, Any]:
     }
 
 
-def _node_metric_view(custom: client.CustomObjectsApi, node_name: str) -> dict[str, Any] | None:
-    """读取 metrics-server 的 Node usage（如果不可用则返回 None）。"""
-    metrics = get_node_metrics(custom)
-    if not metrics:
+def _node_metric_view(custom, node_name, snapshot=None):
+    snapshot = snapshot if snapshot is not None else _metrics_snapshot()
+    usage = snapshot.usage_by_node.get(node_name)
+    if not snapshot.available or not usage:
+        _mark_incomplete("Node usage not checked: metrics missing")
         return None
-    usage = metrics.get(node_name)
-    if not usage:
-        return None
-    cpu_m = _cpu_to_millicores(str(usage.get("cpu", "0")))
-    mem_b = _memory_to_bytes(str(usage.get("memory", "0")))
-    return {
-        "cpu_usage_m": cpu_m,
-        "cpu_usage_human": _format_cpu_m(cpu_m),
-        "memory_usage_bytes": mem_b,
-        "memory_usage_human": _format_bytes(mem_b),
-    }
-
-def get_node_metrics(custom: client.CustomObjectsApi) -> dict[str, dict[str, str]] | None:
-    """
-    读取 metrics.k8s.io 的 Node 指标。
-
-    - 若集群未安装 metrics-server 或无权限，返回 None（上层应降级处理）
-    - 返回格式：
-      {
-        "node-1": {"cpu": "123m", "memory": "456Mi"},
-        ...
-      }
-    """
-
     try:
-        obj = _k8s_api_call(
-            custom.list_cluster_custom_object,
-            group="metrics.k8s.io",
-            version="v1beta1",
-            plural="nodes",
-        )
-    except Exception:
-        logger.debug("metrics-server unavailable, metrics will be omitted")
+        if "cpu" not in usage or "memory" not in usage:
+            raise ValueError("missing quantity")
+        cpu = _cpu_to_millicores(str(usage["cpu"]))
+        memory = _memory_to_bytes(str(usage["memory"]))
+    except ValueError:
+        _mark_incomplete("Node metrics quantity invalid")
         return None
+    return {"cpu_usage_m":cpu,"cpu_usage_human":_format_cpu_m(cpu),
+            "memory_usage_bytes":memory,"memory_usage_human":_format_bytes(memory),
+            "observed_at":snapshot.observed_at.isoformat()}
 
-    items = obj.get("items") if isinstance(obj, dict) else None
-    if not isinstance(items, list):
-        return None
-
-    out: dict[str, dict[str, str]] = {}
-    for it in items:
-        md = it.get("metadata", {}) if isinstance(it, dict) else {}
-        name = md.get("name")
-        usage = it.get("usage", {})
-        if isinstance(name, str) and isinstance(usage, dict):
-            out[name] = {
-                "cpu": str(usage.get("cpu", "")),
-                "memory": str(usage.get("memory", "")),
-            }
-    return out
+def get_node_metrics(custom):
+    snapshot = _metrics_snapshot()
+    return snapshot.usage_by_node if snapshot.available else None
 
 
 _BAD_POD_REASONS = {
@@ -697,12 +720,27 @@ def _pod_issue(pod: client.V1Pod, restart_threshold: int) -> str | None:
 
 
 
-def _problem_reason_list(
-    node: client.V1Node,
-    custom: client.CustomObjectsApi,
-    cfg: InspectorConfig,
-) -> tuple[list[str], dict[str, Any]]:
-    """汇总“该节点为什么可疑”的原因列表，并附带可选的 metrics 详情。"""
+def _validate_page_size(limit):
+    if not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=200:
+        raise K8sOperationError("INVALID_INPUT", "Page/result limit must be between 1 and 200")
+
+
+def _collect_api_items(fn,**kwargs):
+    gateway=_get_gateway()
+    items=[]
+    complete=True
+    for page in gateway.iter_pages(fn,deadline=_DEADLINE.get() or gateway.clock()+gateway.settings.tool_timeout_seconds,**kwargs):
+        items.extend(page.items)
+        complete=complete and page.complete
+    return items,complete
+
+
+def _metrics_snapshot():
+    gateway=_get_gateway()
+    return gateway.fetch_metrics(deadline=_DEADLINE.get() or gateway.clock()+gateway.settings.tool_timeout_seconds)
+
+
+def evaluate_node(node, snapshot, settings):
     conditions = _get_conditions(node)
     reasons: list[str] = []
     metric_detail: dict[str, Any] = {}
@@ -722,7 +760,7 @@ def _problem_reason_list(
         reasons.append("Unschedulable")
 
     # metrics-server 可用时，再根据 usage/capacity 判断是否高负载（HighCPU/HighMemory）。
-    metrics = _node_metric_view(custom, node_name)
+    metrics = _node_metric_view(None, node_name, snapshot)
     capacity = node.status.capacity if node.status else {}
     if metrics and capacity:
         cpu_cap_m = _cpu_to_millicores(str(capacity.get("cpu", "0")))
@@ -736,12 +774,16 @@ def _problem_reason_list(
             "cpu_utilization": cpu_ratio,
             "memory_utilization": mem_ratio,
         }
-        if cpu_ratio >= cfg.thresholds.node_cpu_utilization:
+        if cpu_ratio >= settings.thresholds.node_cpu_utilization:
             reasons.append("HighCPUUsage")
-        if mem_ratio >= cfg.thresholds.node_memory_utilization:
+        if mem_ratio >= settings.thresholds.node_memory_utilization:
             reasons.append("HighMemoryUsage")
 
     return reasons, metric_detail
+
+
+def _problem_reason_list(node, custom, cfg):
+    return evaluate_node(node,_metrics_snapshot(),_get_gateway().settings)
 
 
 def _event_brief(event: client.V1Event) -> dict[str, str]:
@@ -800,22 +842,15 @@ def _pod_suggestions(issue: str | None, phase: str) -> list[str]:
     }
 )
 @_k8s_tool
-def list_nodes(
-    label_selector: Annotated[
-        str | None,
-        Field(description="可选的 Kubernetes label selector，例如 node-role.kubernetes.io/worker"),
-    ] = None,
-) -> dict[str, Any]:
-    """列出集群中的节点，并返回适合 LLM 阅读的扁平化摘要。"""
-
-    kube = _get_k8s_clients()
-    nodes = _k8s_api_call(kube.core.list_node, label_selector=label_selector or None).items
-    items = [_parse_node(node) for node in nodes]
-    return {
-        "cluster": kube.display_name,
-        "count": len(items),
-        "items": items,
-    }
+def list_nodes(label_selector: Annotated[str|None,Field(description="Optional Kubernetes label selector")]=None,
+               limit: Annotated[int,Field(ge=1,le=200)]=100,continue_token: str|None=None) -> dict[str,Any]:
+    _validate_page_size(limit)
+    kube=_get_k8s_clients()
+    page=_k8s_api_call(kube.core.list_node,label_selector=label_selector or None,limit=limit,_continue=continue_token)
+    nodes, token=_page_parts(page)
+    items=[_parse_node(node) for node in nodes]
+    return {"cluster":kube.display_name,"count":len(items),"returned":len(items),"items":items,
+            "continue_token":token,"coverage_scope":"page"}
 
 
 @mcp.tool(
@@ -992,44 +1027,28 @@ def get_node_resource_usage(
     }
 )
 @_k8s_tool
-def find_problem_nodes(
-    label_selector: Annotated[
-        str | None,
-        Field(description="可选的节点标签过滤条件"),
-    ] = None,
-) -> dict[str, Any]:
-    """扫描异常节点，自动识别 NotReady、磁盘/内存压力以及高负载节点。"""
-
-    kube = _get_k8s_clients()
-    cfg = _get_runtime_config()
-    nodes = _k8s_api_call(kube.core.list_node, label_selector=label_selector or None).items
-    items: list[dict[str, Any]] = []
-
+def find_problem_nodes(label_selector: Annotated[str|None,Field(description="Optional node label filter")]=None,
+                       max_results: Annotated[int,Field(ge=1,le=200)]=100) -> dict[str,Any]:
+    _validate_page_size(max_results)
+    kube=_get_k8s_clients()
+    cfg=_get_runtime_config()
+    nodes,scan_complete=_collect_api_items(kube.core.list_node,label_selector=label_selector or None)
+    snapshot=_metrics_snapshot()
+    items=[]
     for node in nodes:
-        reasons, metric_detail = _problem_reason_list(node, kube.custom, cfg)
-        if not reasons:
-            continue
-        items.append(
-            {
-                "name": _safe_name(node),
-                "status": "Ready" if _get_conditions(node).get("Ready") == "True" else "NotReady",
-                "internal_ip": _get_node_addresses(node).get("InternalIP", ""),
-                "age": _format_age(getattr(node.metadata, "creation_timestamp", None)),
-                "reasons": reasons,
-                "conditions": _get_conditions(node),
-                "metrics": metric_detail,
-            }
-        )
-
-    return {
-        "cluster": kube.display_name,
-        "count": len(items),
-        "thresholds": {
-            "node_cpu_utilization": cfg.thresholds.node_cpu_utilization,
-            "node_memory_utilization": cfg.thresholds.node_memory_utilization,
-        },
-        "items": items,
-    }
+        reasons,details=evaluate_node(node,snapshot,_get_gateway().settings)
+        if reasons:
+            items.append({"name":_safe_name(node),"status":"Ready" if _get_conditions(node).get("Ready")=="True" else "NotReady",
+                          "internal_ip":_get_node_addresses(node).get("InternalIP",""),"age":_format_age(getattr(node.metadata,"creation_timestamp",None)),
+                          "reasons":reasons,"conditions":_get_conditions(node),"metrics":details})
+    ranks={"NodeNotReady":0,"DiskPressure":1,"MemoryPressure":1,"PIDPressure":1,"NetworkUnavailable":1,"HighCPUUsage":2,"HighMemoryUsage":2,"Unschedulable":3}
+    items.sort(key=lambda item:(min(ranks.get(reason,4) for reason in item["reasons"]),item["name"]))
+    truncated=len(items)>max_results
+    if truncated:_mark_incomplete("Problem-node output truncated; narrow the label selector")
+    return {"cluster":kube.display_name,"count":len(items[:max_results]),"items":items[:max_results],
+            "thresholds":{"node_cpu_utilization":cfg.thresholds.node_cpu_utilization,"node_memory_utilization":cfg.thresholds.node_memory_utilization},
+            "scanned_count":len(nodes),"matched_count":len(items) if scan_complete and snapshot.complete else None,
+            "output_truncated":truncated,"complete":scan_complete and snapshot.complete and not truncated,"coverage_scope":"scan"}
 
 
 @mcp.tool(
@@ -1041,27 +1060,17 @@ def find_problem_nodes(
     }
 )
 @_k8s_tool
-def list_node_pods(
-    node_name: Annotated[str, Field(description="节点名称")],
-) -> dict[str, Any]:
-    """列出指定节点上的活跃 Pod，便于 LLM 继续做资源和异常分析。"""
-
-    kube = _get_k8s_clients()
-    pods = _active_pods_on_node(kube.core, node_name)
-    cfg = _get_runtime_config()
-    items: list[dict[str, Any]] = []
-    for pod in pods:
-        issue = _pod_issue_summary(pod, cfg.thresholds.pod_restart_count)
-        item = _pod_basic_view(pod)
-        item["issue"] = issue
-        items.append(item)
-
-    return {
-        "cluster": kube.display_name,
-        "node": node_name,
-        "count": len(items),
-        "items": items,
-    }
+def list_node_pods(node_name: Annotated[str,Field(description="Node name")],
+                   limit: Annotated[int,Field(ge=1,le=200)]=100,continue_token: str|None=None) -> dict[str,Any]:
+    _validate_page_size(limit)
+    kube=_get_k8s_clients()
+    page=_k8s_api_call(kube.core.list_pod_for_all_namespaces,field_selector=f"spec.nodeName={node_name}",limit=limit,_continue=continue_token)
+    pods, token=_page_parts(page)
+    threshold=_get_runtime_config().thresholds.pod_restart_count
+    items=[{**_pod_basic_view(pod),"issue":_pod_issue_summary(pod,threshold)} for pod in pods
+           if getattr(pod.status,"phase",None) not in {"Succeeded","Failed"}]
+    return {"cluster":kube.display_name,"node":node_name,"count":len(items),"returned":len(items),
+            "items":items,"continue_token":token,"coverage_scope":"page"}
 
 
 def _find_problem_container_name(pod: client.V1Pod) -> str | None:
@@ -1169,49 +1178,24 @@ def diagnose_pod_issues(
     }
 )
 @_k8s_tool
-def health_check() -> dict[str, Any]:
-    """验证 MCP Server 与 K8s API 的连接状态。"""
-    try:
-        kube = _get_k8s_clients()
-        nodes = _k8s_api_call(kube.core.list_node)
-        return {
-            "status": "healthy",
-            "cluster": kube.display_name,
-            "node_count": len(nodes.items),
-        }
-    except Exception as e:
-        logger.warning("Health check failed: %s", e)
-        return {"status": "unhealthy", "error": str(e)}
+def health_check() -> dict[str,Any]:
+    kube=_get_k8s_clients()
+    _k8s_api_call(kube.core.list_node,limit=1)
+    return {"status":"healthy","cluster":kube.display_name,"node_count":None,
+            "warnings":["Connectivity check does not count all nodes"]}
 
 
 @mcp.resource("k8s://cluster/summary")
 @_k8s_tool
-def cluster_summary() -> dict[str, Any]:
-    """提供一个轻量级集群摘要，便于 LLM 在开始诊断前快速建立上下文。"""
-
-    kube = _get_k8s_clients()
-    cfg = _get_runtime_config()
-    nodes = _k8s_api_call(kube.core.list_node).items
-    problem_nodes = 0
-    for node in nodes:
-        reasons, _metric = _problem_reason_list(node, kube.custom, cfg)
-        if reasons:
-            problem_nodes += 1
-
-    return {
-        "cluster": kube.display_name,
-        "node_count": len(nodes),
-        "problem_node_count": problem_nodes,
-        "available_tools": [
-            "list_nodes",
-            "get_node_detail",
-            "get_node_resource_usage",
-            "find_problem_nodes",
-            "list_node_pods",
-            "diagnose_pod_issues",
-            "health_check",
-        ],
-    }
+def cluster_summary() -> dict[str,Any]:
+    kube=_get_k8s_clients()
+    nodes,complete=_collect_api_items(kube.core.list_node)
+    snapshot=_metrics_snapshot()
+    problems=sum(bool(evaluate_node(node,snapshot,_get_gateway().settings)[0]) for node in nodes)
+    return {"cluster":kube.display_name,"node_count":len(nodes) if complete else None,"scanned_count":len(nodes),
+            "problem_node_count":problems if complete and snapshot.complete else None,"observed_problem_node_count":problems,
+            "complete":complete and snapshot.complete,"coverage_scope":"scan",
+            "available_tools":["list_nodes","get_node_detail","get_node_resource_usage","find_problem_nodes","list_node_pods","diagnose_pod_issues","health_check"]}
 
 
 @mcp.prompt
