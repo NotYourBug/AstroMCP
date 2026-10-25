@@ -28,7 +28,7 @@
 
 首次 SSH 连接前，通过可信渠道核验指纹，再录入 known_hosts；不会自动接受陌生/变化的密钥。密钥路径支持 Paramiko 文件认证，也可使用 ssh-agent/默认密钥；远程操作须提供用户名。兼容密码参数，但密码不进入服务日志或公开配置示例。工具参数和结果可能被 MCP 客户端记录，应由可信本地操作者使用。
 
-本机采集有 4 个有界 worker。CPU 采样窗为 1 秒；ping 和 TCP 探测各 5 秒。取消等待会关闭 SSH/探测资源；同步 worker 真正结束之前保留并发额度。Python 线程无法强行终止，底层库或系统调用不返回时可能延迟进程退出，不能将这些预算理解为可强杀线程的保证。
+本机采集有 4 个有界 worker。CPU 采样窗为 1 秒；ping 和 TCP 探测最多各 5 秒，并受工具剩余预算约束。取消等待会关闭 SSH/探测资源；同步 worker 真正结束之前保留并发额度。Python 线程无法强行终止，底层库或系统调用不返回时可能延迟进程退出，不能将这些预算理解为可强杀线程的保证。
 
 ## Kubernetes
 
@@ -60,7 +60,7 @@
 | `pending_seconds` | `PENDING_SECONDS` | 300，>0 |
 | `ready_seconds` | `READY_SECONDS` | 60，>0 |
 
-SDK 显式关闭自动重试，每次 API 调用使用 connect/read timeout 和工具剩余预算。分页、限流排队、Events 和日志共用请求 deadline；无法中断已经执行的同步 SDK 调用。Metrics 每次扫描只获取一个快照，不跨请求缓存。RBAC 示例见 [k8s-readonly-rbac.yaml](../examples/k8s-readonly-rbac.yaml)，只包含 get/list；它是集群范围取证示例，部署者应按实际范围收窄。应用从不自动应用该文件。
+运行依赖限定 Kubernetes SDK 37.x，锁定版本 37.0.1；Pod 反序列化使用该版本公开接口并以真实 SDK 做内存 HTTP 测试。SDK 显式关闭自动重试，每次 API 调用使用 connect/read timeout 和工具剩余预算。分页、限流排队、Events 和日志共用请求 deadline，调用返回及发布结果前再次检查截止时间，过期结果不能宣告完整成功；无法中断已经执行的同步 SDK 调用。Metrics 每次扫描只获取一个快照，不跨请求缓存。RBAC 示例见 [k8s-readonly-rbac.yaml](../examples/k8s-readonly-rbac.yaml)，只包含 get/list；它是集群范围取证示例，部署者应按实际范围收窄。应用从不自动应用该文件。
 
 日志在服务端限制为 16384 bytes、展示为 4000 chars；Events 按 Pod UID 筛选并选择最新 20 条。脱敏覆盖常见密码、token、私钥格式，无法保证识别任意业务敏感内容。关闭日志或收窄凭据权限可减少可读取内容。
 

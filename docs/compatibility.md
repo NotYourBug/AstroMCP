@@ -35,6 +35,8 @@ TCP 连接拒绝是正常的 `ok=true, open=false`；DNS、超时和不可达为
 
 所有工具增添 `complete/warnings/request_id/timestamp`。`ok` 表示本次工具是否取得主要结果，`complete` 表示声明范围内的取证是否完整；缺 metrics、events/log 403、分页截止不能解释成“无问题”。旧 `issue` 摘要、`items/cluster` 字段保留，结构化 findings 区分当前错误、警告、恢复历史与未知状态。
 
+Running Pod 的 Ready 条件缺失/Unknown 会返回 `ReadinessUnknown` 并标记诊断不完整；Node 容量缺失、零值或非法值会使利用率检查不完整，全量问题节点数为 null，同时保留已确认的条件异常。尚有一项低优先级限制：详情样本最多 20 个 Pod、资源 breakdown 最多 50 行，当前没有独立的明细截断标志；资源汇总仍覆盖所有已扫描 Pod，详见关闭记录中的延期项。
+
 资源审计计算传统容器、可重启 init sidecar、init 峰值及 Pod overhead；缺失 limit 表示无显式上界，`limits_unbounded` 标记，配置 limit 的和不是总上限。Pod-level resources 或已分配/声明资源不一致的动态 resize 暂不支持，报告 incomplete/unknown，超配布尔值为 null。不会将未知值当成“确定无超配”。
 
 requests 超配建议按实际 requests 贡献排列负载，保留 `eviction_suggestion=null` 兼容字段；不再基于 QoS 建议直接迁移 BestEffort。只提供取证建议，不执行驱逐、迁移或任何写操作。历史 OOM/已完成 init 不自动判为当前硬故障，Pending/未就绪按持续时间评级。
