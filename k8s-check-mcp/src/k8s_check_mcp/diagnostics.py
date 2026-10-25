@@ -98,6 +98,8 @@ def evaluate_pod(pod, *, thresholds: Thresholds, now: datetime) -> list[Finding]
         unready = _value(condition, "status") == "False" or any(
             (_value(cs, "ready") is False for cs, kind in _container_statuses(pod) if kind == "app")
         )
+        if not unready and _value(condition, "status") != "True":
+            findings.append(Finding("ReadinessUnknown", "warning"))
         if unready:
             age = _age_seconds(
                 _value(condition, "last_transition_time") if condition is not None else created, now
@@ -169,7 +171,11 @@ def _pod_issue_summary(pod, restart_threshold, thresholds=None):
 
 def _pod_suggestions(issue: str | None, phase: str, findings=None) -> list[str]:
     """把常见 issue/phase 映射成可操作的排障建议（给 LLM 作为输出参考）。"""
-    if findings and any(f.code == "Starting" for f in findings):
+    if (
+        findings
+        and not any(f.severity in {"error", "warning"} for f in findings)
+        and any(f.code == "Starting" for f in findings)
+    ):
         return ["Pod is still starting; inspect readiness and events before judging health."]
     if issue is None and phase == "Running":
         return ["Pod 当前未发现明显异常，可继续检查依赖服务、探针与业务日志。"]
@@ -192,6 +198,19 @@ def _pod_suggestions(issue: str | None, phase: str, findings=None) -> list[str]:
     return out
 
 
+def node_capacity(node):
+    """Return valid utilization denominators, preserving unknown dimensions as None."""
+    capacity = _value(_value(node, "status"), "capacity") or {}
+    values = []
+    for key, parse in (("cpu", _cpu_to_millicores), ("memory", _memory_to_bytes)):
+        try:
+            value = parse(str(_value(capacity, key, "0")))
+            values.append(value if value > 0 else None)
+        except (ValueError, TypeError):
+            values.append(None)
+    return tuple(values)
+
+
 def evaluate_node(node, snapshot, settings):
     conditions = _get_conditions(node)
     reasons: list[str] = []
@@ -210,12 +229,10 @@ def evaluate_node(node, snapshot, settings):
     if bool(getattr(node.spec, "unschedulable", False)):
         reasons.append("Unschedulable")
     metrics = node_metric_view(node_name, snapshot)
-    capacity = node.status.capacity if node.status else {}
-    if metrics and capacity:
-        cpu_cap_m = _cpu_to_millicores(str(capacity.get("cpu", "0")))
-        mem_cap_b = _memory_to_bytes(str(capacity.get("memory", "0")))
-        cpu_ratio = _ratio(metrics["cpu_usage_m"], cpu_cap_m)
-        mem_ratio = _ratio(metrics["memory_usage_bytes"], mem_cap_b)
+    if metrics:
+        cpu_cap_m, mem_cap_b = node_capacity(node)
+        cpu_ratio = _ratio(metrics["cpu_usage_m"], cpu_cap_m or 0)
+        mem_ratio = _ratio(metrics["memory_usage_bytes"], mem_cap_b or 0)
         metric_detail = {
             **metrics,
             "cpu_capacity_m": cpu_cap_m,

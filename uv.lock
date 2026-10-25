@@ -323,7 +323,7 @@ yaml = [
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=3,<4" },
-    { name = "kubernetes", specifier = ">=29" },
+    { name = "kubernetes", specifier = ">=37,<38" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "pyyaml", marker = "extra == 'yaml'", specifier = ">=6,<7" },
 ]

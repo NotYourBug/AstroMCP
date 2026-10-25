@@ -42,9 +42,14 @@ class SSHExecutor:
             return CommandResult(error_code="INVALID_INPUT", complete=False)
         key = (connection.host, connection.port, connection.username)
         queue_end = min(deadline, self.clock() + self.settings.queue_timeout_seconds)
+        first_attempt = True
         while not self._closed:
-            if self.clock() >= queue_end:
+            now = self.clock()
+            if now >= deadline:
+                return CommandResult(error_code="TIMEOUT", complete=False)
+            if not first_attempt and now >= queue_end:
                 return CommandResult(error_code="BUSY", complete=False)
+            first_attempt = False
             if self._sem.acquire(blocking=False):
                 with self._lock:
                     entry = self._targets.setdefault(
@@ -56,6 +61,8 @@ class SSHExecutor:
                     if entry[1] == 0:
                         self._targets.pop(key, None)
                 self._sem.release()
+            if self.clock() >= queue_end:
+                return CommandResult(error_code="BUSY", complete=False)
             await asyncio.sleep(0.005)
         else:
             return CommandResult(error_code="BUSY", complete=False)

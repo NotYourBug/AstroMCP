@@ -91,20 +91,38 @@ class K8sGateway:
             if preserve:
                 kwargs["_preload_content"] = False
             response = fn(*args, **kwargs)
-            if preserve and isinstance(getattr(response, "data", None), (bytes, str)):
+            if preserve:
                 try:
-                    raw = json.loads(response.data)
+                    body = getattr(response, "data", None)
+                    if self.clock() >= deadline:
+                        raise K8sOperationError("TIMEOUT", "Kubernetes response exceeded deadline")
+                    if not isinstance(body, (bytes, str)):
+                        return response
+                    text = body.decode("utf-8") if isinstance(body, bytes) else body
+                    raw = json.loads(text)
                     result = self.clients.api_client.deserialize(
-                        response, "V1Pod" if name == "read_namespaced_pod" else "V1PodList"
+                        text,
+                        "V1Pod" if name == "read_namespaced_pod" else "V1PodList",
+                        "application/json",
                     )
                     if name == "read_namespaced_pod":
                         result._astromcp_raw = raw
                     else:
                         for pod, item in zip(result.items, raw.get("items", [])):
                             pod._astromcp_raw = item
+                    if self.clock() >= deadline:
+                        raise K8sOperationError("TIMEOUT", "Kubernetes decoding exceeded deadline")
                     return result
+                except (ValueError, TypeError):
+                    raise K8sOperationError(
+                        "PARSE_ERROR", "Kubernetes Pod response is malformed"
+                    ) from None
                 finally:
-                    response.release_conn()
+                    release = getattr(response, "release_conn", None)
+                    if callable(release):
+                        release()
+            if self.clock() >= deadline:
+                raise K8sOperationError("TIMEOUT", "Kubernetes response exceeded deadline")
             return response
         except ApiException as exc:
             code = {

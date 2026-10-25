@@ -16,6 +16,7 @@ from .diagnostics import (
     _pod_suggestions,
     evaluate_node,
     evaluate_pod,
+    node_capacity,
     select_problem_container,
     summarize_issue,
 )
@@ -68,6 +69,12 @@ def _operation(fn):
                     "error_code": "CONFIG_ERROR",
                     "complete": False,
                 }
+            if gateway.clock() >= _DEADLINE.get():
+                _mark_incomplete("TIMEOUT: tool deadline exceeded")
+                if fn.__name__ == "health_check":
+                    result.update(
+                        ok=False, error_code="TIMEOUT", error="Connectivity deadline exceeded"
+                    )
             result.setdefault("ok", "error" not in result)
             if fn.__name__ == "health_check" and (not result["ok"]):
                 result["status"] = "unhealthy"
@@ -118,12 +125,21 @@ class K8sInspector:
         if any(node_metric_view(_safe_name(node), snapshot) is None for node in nodes):
             snapshot.complete = False
             _mark_incomplete("Node usage not checked: metrics missing or invalid")
+        if any(None in node_capacity(node) for node in nodes):
+            snapshot.complete = False
+            _mark_incomplete("Node utilization not checked: capacity missing, zero or invalid")
         return snapshot
 
-    def pod_basic_view(self, pod, thresholds=None):
+    def pod_findings(self, pod, thresholds=None):
         findings = evaluate_pod(
             pod, thresholds=thresholds or self.settings.thresholds, now=_now_utc()
         )
+        if any(f.code in {"MissingStatus", "ReadinessUnknown"} for f in findings):
+            _mark_incomplete("Pod status/readiness evidence is missing or unknown")
+        return findings
+
+    def pod_basic_view(self, pod, thresholds=None):
+        findings = self.pod_findings(pod, thresholds)
         return pod_basic_view(pod, findings, summarize_issue(findings), _pod_restart_count(pod))
 
     def collect_api_items(self, fn, **kwargs):
@@ -455,10 +471,9 @@ class K8sInspector:
         - CrashLoopBackOff / ImagePullBackOff 等：尝试读取 previous 日志
         """
         kube = self.gateway.clients
-        cfg = self.settings
         pod = self.call(kube.core.read_namespaced_pod, name=pod_name, namespace=namespace)
         phase = pod.status.phase if pod.status else ""
-        findings = evaluate_pod(pod, thresholds=cfg.thresholds, now=_now_utc())
+        findings = self.pod_findings(pod)
         issue = summarize_issue(findings)
         problem_container = select_problem_container(pod, findings)
         gateway = self.gateway

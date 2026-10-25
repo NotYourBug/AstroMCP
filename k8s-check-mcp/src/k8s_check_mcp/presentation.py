@@ -152,7 +152,9 @@ def redact_common_secrets(text: str) -> str:
         flags=re.DOTALL,
     )
     text = re.sub(
-        "(?i)(authorization\\s*:\\s*bearer\\s+)\\S+", lambda match: match[1] + "[REDACTED]", text
+        r"""(?i)(\bauthorization["']?\s*:\s*["']?bearer\s+)[^"'\s,;]+""",
+        lambda match: match[1] + "[REDACTED]",
+        text,
     )
     return re.sub(
         "(?i)(\\b(?:password|passwd|token|api[_-]?key|secret)\\b[\"']?\\s*[:=]\\s*)(?:\"[^\"]*\"|'[^']*'|[^\\s,;]+)",

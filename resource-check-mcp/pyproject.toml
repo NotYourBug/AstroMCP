@@ -13,4 +13,3 @@ astromcp-host = "resource_check_mcp.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

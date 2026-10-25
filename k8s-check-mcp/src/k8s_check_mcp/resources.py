@@ -66,18 +66,31 @@ def effective_resources(pod) -> PodResources:
     status = _value(source, "status")
     if _value(status, "resize"):
         warnings.append("UNSUPPORTED_RESOURCE_MODEL")
+    if any(
+        _value(condition, "type") in {"PodResizePending", "PodResizeInProgress"}
+        and _value(condition, "status") != "False"
+        for condition in _value(status, "conditions") or []
+    ):
+        warnings.append("UNSUPPORTED_RESOURCE_MODEL")
     declared = {
-        _value(c, "name"): _value(_value(c, "resources"), "requests") or {}
+        _value(c, "name"): _value(c, "resources") or {}
         for c in (_value(spec, "containers") or []) + (_value(spec, "init_containers") or [])
     }
     for cs, _ in _container_statuses(source):
-        allocated = _value(cs, "allocated_resources") or _value(_value(cs, "resources"), "requests")
-        if allocated:
-            request = declared.get(_value(cs, "name"), {})
+        actual = _value(cs, "resources")
+        comparisons = [
+            ("requests", _value(cs, "allocated_resources")),
+            ("requests", _value(actual, "requests")),
+            ("limits", _value(actual, "limits")),
+        ]
+        for section, observed in comparisons:
+            if not observed:
+                continue
+            declaration = _value(declared.get(_value(cs, "name"), {}), section) or {}
             for resource in ("cpu", "memory"):
-                value = _value(allocated, resource)
+                value = _value(observed, resource)
                 if value is not None and parse_quantity_decimal(value) != parse_quantity_decimal(
-                    _value(request, resource, "0")
+                    _value(declaration, resource, "0")
                 ):
                     warnings.append("UNSUPPORTED_RESOURCE_MODEL")
     req = _effective_pair(spec, "requests")

@@ -82,7 +82,7 @@ class HostService:
     async def check_host_status(
         self, hostname: Annotated[str, Field(description="主机名或 IP 地址")]
     ) -> dict:
-        return await probe_ping(hostname)
+        return await probe_ping(hostname, timeout=_probe_timeout())
 
     @_operation
     async def check_disk_usage(
@@ -143,11 +143,19 @@ class HostService:
         host: Annotated[str, Field(description="主机名或 IP 地址")],
         port: Annotated[int, Field(description="端口号")],
     ) -> dict:
-        return await probe_tcp(host, port)
+        return await probe_tcp(host, port, timeout=_probe_timeout())
 
     async def aclose(self):
         await self.executor.aclose()
         await self.local.aclose()
+
+
+def _probe_timeout():
+    deadline = _TOOL_DEADLINE.get()
+    remaining = deadline - time.monotonic() if deadline is not None else 5
+    if remaining <= 0:
+        raise HostOperationError("TIMEOUT", "Tool deadline exceeded before probe")
+    return min(5, remaining)
 
 
 def create_server(
