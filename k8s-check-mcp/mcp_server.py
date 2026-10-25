@@ -34,7 +34,14 @@ from fastmcp import FastMCP
 from kubernetes import client, config
 from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from collections.abc import Mapping
+from typing import Literal
+from contextvars import ContextVar
+from functools import wraps
+from uuid import uuid4
+import argparse, ipaddress
+from urllib3.exceptions import HTTPError, ReadTimeoutError
 
 # MCP Server 主对象：用于注册 tools/resources/prompts，并对外运行协议服务。
 mcp = FastMCP("K8s Check MCP")
@@ -60,269 +67,252 @@ class MCPKubeClients:
     custom: client.CustomObjectsApi
 
 
-@dataclass
-class Thresholds:
-    """诊断阈值集合（默认值更偏教学/示例，可按环境变量覆盖）。"""
-
-    node_cpu_utilization: float = 0.80
-    node_memory_utilization: float = 0.85
-    pod_restart_count: int = 3
-    requests_overcommit_ratio: float = 1.0
-    limits_overcommit_ratio: float = 1.5
+class Thresholds(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    node_cpu_utilization: float = Field(default=.80, ge=0, le=1)
+    node_memory_utilization: float = Field(default=.85, ge=0, le=1)
+    pod_restart_count: int = Field(default=3, ge=1)
+    requests_overcommit_ratio: float = Field(default=1, gt=0)
+    limits_overcommit_ratio: float = Field(default=1.5, gt=0)
+    pending_seconds: float = Field(default=300, gt=0)
+    ready_seconds: float = Field(default=60, gt=0)
 
 
 @dataclass
 class InspectorConfig:
-    """
-    MCP Server 的运行配置（精简版）。
-
-    与原巡检项目解耦：
-    - 这里不依赖任何其他模块
-    - 仅保留 MCP 工具需要的阈值与少量开关
-    """
-
     thresholds: Thresholds = field(default_factory=Thresholds)
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    """从环境变量读取布尔值，允许 1/true/yes/on 等常见写法。"""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+class K8sSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    thresholds: Thresholds = Field(default_factory=Thresholds)
+    in_cluster: bool = False
+    kubeconfig: str | None = None
+    context: str | None = None
+    verify_ssl: bool = True
+    connect_timeout_seconds: float = Field(default=3, gt=0)
+    read_timeout_seconds: float = Field(default=10, gt=0)
+    tool_timeout_seconds: float = Field(default=30, gt=0)
+    queue_timeout_seconds: float = Field(default=2, ge=0)
+    api_rps: float = Field(default=5, gt=0)
+    api_burst: int = Field(default=10, ge=1)
+    api_max_in_flight: int = Field(default=3, ge=1)
+    rate_limit_enabled: bool = True
+    page_size: int = Field(default=200, ge=1, le=200)
+    max_objects: int = Field(default=10000, ge=1)
+    include_logs: bool = True
+    transport: Literal["stdio","http","sse"] = "stdio"
+    bind_host: str = "127.0.0.1"
+    bind_port: int = Field(default=8080, ge=1, le=65535)
+
+    @model_validator(mode="after")
+    def validate_budget(self):
+        if self.queue_timeout_seconds >= self.tool_timeout_seconds:
+            raise ValueError("Queue budget must be less than tool budget")
+        return self
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return float(raw.strip())
-    except Exception:
-        return default
+def load_settings(environ: Mapping[str,str], config_path: Path | None = None) -> K8sSettings:
+    path = config_path or (Path(environ["MCP_CONFIG"]) if environ.get("MCP_CONFIG") else None)
+    data = {}
+    if path:
+        raw = path.read_text(encoding="utf-8")
+        if path.suffix.lower() in {".yaml",".yml"}:
+            try:
+                import yaml
+            except ImportError as exc:
+                raise ValueError("YAML requires astromcp-k8s[yaml]") from exc
+            try:
+                data = yaml.safe_load(raw)
+            except yaml.YAMLError as exc:
+                raise ValueError("Invalid YAML configuration") from exc
+        else:
+            data = json.loads(raw)
+    if not isinstance(data,dict):
+        raise ValueError("Configuration must be an object")
+    threshold_data = dict(data.get("thresholds", {}))
+    for name in Thresholds.model_fields:
+        key = "MCP_THRESHOLD_"+name.upper()
+        if key in environ:
+            threshold_data[name] = environ[key]
+    data["thresholds"] = threshold_data
+    names = {"MCP_K8S_IN_CLUSTER":"in_cluster", "MCP_K8S_KUBECONFIG":"kubeconfig", "MCP_K8S_CONTEXT":"context",
+             "MCP_K8S_VERIFY_SSL":"verify_ssl", "MCP_K8S_CONNECT_TIMEOUT_SECONDS":"connect_timeout_seconds",
+             "MCP_K8S_READ_TIMEOUT_SECONDS":"read_timeout_seconds", "MCP_TOOL_TIMEOUT_SECONDS":"tool_timeout_seconds",
+             "MCP_QUEUE_TIMEOUT_SECONDS":"queue_timeout_seconds", "MCP_K8S_API_RPS":"api_rps",
+             "MCP_K8S_API_BURST":"api_burst", "MCP_K8S_API_MAX_IN_FLIGHT":"api_max_in_flight",
+             "MCP_K8S_RATE_LIMIT_ENABLED":"rate_limit_enabled", "MCP_K8S_PAGE_SIZE":"page_size",
+             "MCP_K8S_MAX_OBJECTS":"max_objects", "MCP_K8S_INCLUDE_LOGS":"include_logs",
+             "MCP_TRANSPORT":"transport", "MCP_BIND_HOST":"bind_host", "MCP_BIND_PORT":"bind_port"}
+    data.update({field:environ[key] for key,field in names.items() if key in environ})
+    return K8sSettings.model_validate(data)
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return int(raw.strip())
-    except Exception:
-        return default
+class K8sOperationError(Exception):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
 
-'''
-K8s API 调用速率限制器（令牌桶算法）-- 三层限流保护
-1. 令牌桶限流（控制RPS = 每秒请求数）
-2. 最大突发burst（控制瞬间流量）
-3. 最大并发数max_in_flight（控制同时进行中的调用数）
-是同步线程安全版本（不是异步），用于限制kubernetes API请求频率
-'''
-class _TokenBucketLimiter:
-    def __init__(self, rps: float, burst: int, max_in_flight: int) -> None:
-        self._rps = float(rps)                  # 每秒生成多少令牌（核心数率） 
-        self._capacity = max(int(burst), 1)     # 桶的最大容量（突发上限）
-        self._tokens = float(self._capacity)    # 当前令牌数（初始满桶）
-        self._updated_at = time.monotonic()     # 上一次更新令牌时间（用于计算令牌生成）
-        self._lock = threading.Lock()           # 线程锁，保证多线程安全修改令牌
-        self._sem = threading.Semaphore(max(int(max_in_flight), 1))  # 最大并发数信号量
 
-    # 拿令牌 + 强并发名额
-    def acquire(self) -> None:
-        self._sem.acquire()     # 【第一步：先抢并发名额 → 最多3个同时运行】
+class TokenBucketLimiter:
+    def __init__(self, rps, burst, max_in_flight, *, queue_timeout=2, enabled=True, clock=time.monotonic):
+        self._rps, self._capacity = rps, burst
+        self._tokens = float(burst)
+        self._clock = clock
+        self._updated_at = clock()
+        self._lock = threading.Lock()
+        self._sem = threading.BoundedSemaphore(max_in_flight)
+        self.queue_timeout, self.enabled = queue_timeout, enabled
+
+    def acquire(self, *, deadline):
+        now = self._clock()
+        if now >= deadline:
+            raise K8sOperationError("TIMEOUT", "Operation deadline exceeded")
+        end = min(deadline, now+self.queue_timeout)
+        if not self._sem.acquire(timeout=max(0,end-now)):
+            raise K8sOperationError("BUSY", "API concurrency budget exhausted")
         try:
-            if self._rps <= 0:
-                return
-            while True:
-                wait_s = 0.0
-                with self._lock:  # 加锁，多线程安全修改令牌
-                    now = time.monotonic()
-                    elapsed = max(now - self._updated_at, 0.0)  # 距离上次更新过了多少时间
-                    # 【核心：根据时间差计算并填充令牌】
-                    if elapsed > 0:
-                        self._tokens = min(self._capacity, self._tokens + elapsed * self._rps) # 时间 x 速率
-                        self._updated_at = now
-                    # 【有令牌 → 拿走一个，直接返回】
-                    if self._tokens >= 1.0:
-                        self._tokens -= 1.0
+            while self.enabled:
+                with self._lock:
+                    now = self._clock()
+                    self._tokens = min(self._capacity,self._tokens+max(now-self._updated_at,0)*self._rps)
+                    self._updated_at = now
+                    if self._tokens >= 1:
+                        self._tokens -= 1
                         return
-                    # 【没令牌 → 计算还需要等多久才能生成1个令牌】
-                    wait_s = (1.0 - self._tokens) / self._rps
-                time.sleep(max(wait_s, 0.001))  # 【等待一段时间再重试：至少0.001秒，避免CPU占用过高】
-        except Exception:
+                    wait = (1-self._tokens)/self._rps
+                if now >= end:
+                    raise K8sOperationError("BUSY", "API rate-limit queue budget exhausted")
+                time.sleep(min(wait,max(0,end-now),.05))
+        except BaseException:
             self._sem.release()
             raise
 
-    def release(self) -> None:
-        self._sem.release()  # 【第二步：释放并发名额，下一个请求可以进来】
+    def release(self):
+        self._sem.release()
 
 
-_API_LIMITER: _TokenBucketLimiter | None = None
-_API_LIMITER_LOCK = threading.Lock()
-
-# 全局单例，唯一限流器，所有K8s API共用一套限流规则
-def _get_api_limiter() -> _TokenBucketLimiter:
-    global _API_LIMITER
-    if _API_LIMITER is not None:
-        return _API_LIMITER
-    with _API_LIMITER_LOCK:
-        if _API_LIMITER is not None:
-            return _API_LIMITER
-        rps = _env_float("MCP_K8S_API_RPS", 5.0)
-        burst = _env_int("MCP_K8S_API_BURST", 10)
-        max_in_flight = _env_int("MCP_K8S_API_MAX_IN_FLIGHT", 3)
-        _API_LIMITER = _TokenBucketLimiter(rps=rps, burst=burst, max_in_flight=max_in_flight)
-        return _API_LIMITER
-
-# 包装函数，所有K8s API调用都会经过这里
-def _k8s_api_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
-    limiter = _get_api_limiter()
-    limiter.acquire()
-    try:
-        return fn(*args, **kwargs)
-    finally:
-        limiter.release()
-
-
-def _load_config_file(path: str | None) -> dict[str, Any]:
-    if not path:
-        return {}
-    p = Path(path)
-    try:
-        raw = p.read_text(encoding="utf-8")
-    except Exception:
-        logger.warning("Cannot read config file: %s", path)
-        return {}
-    if p.suffix.lower() in {".yaml", ".yml"}:
-        try:
-            import yaml  # type: ignore
-        except Exception as e:
-            raise RuntimeError("读取 YAML 配置需要安装 PyYAML") from e
-        data = yaml.safe_load(raw) or {}
-        return data if isinstance(data, dict) else {}
-    try:
-        data = json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError:
-        logger.warning("Invalid JSON in config file: %s", path)
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _deep_get(d: dict[str, Any], path: list[str], default: Any) -> Any:
-    cur: Any = d
-    for key in path:
-        if not isinstance(cur, dict) or key not in cur:
-            return default
-        cur = cur[key]
-    return cur
-
-
-def _build_runtime_config() -> InspectorConfig:
-    cfg = InspectorConfig()
-    data = _load_config_file((os.getenv("MCP_CONFIG") or "").strip() or None)
-
-    t = cfg.thresholds
-    t.node_cpu_utilization = float(
-        _deep_get(data, ["thresholds", "node_cpu_utilization"], t.node_cpu_utilization)
-    )
-    t.node_memory_utilization = float(
-        _deep_get(data, ["thresholds", "node_memory_utilization"], t.node_memory_utilization)
-    )
-    t.pod_restart_count = int(_deep_get(data, ["thresholds", "pod_restart_count"], t.pod_restart_count))
-    t.requests_overcommit_ratio = float(
-        _deep_get(data, ["thresholds", "requests_overcommit_ratio"], t.requests_overcommit_ratio)
-    )
-    t.limits_overcommit_ratio = float(
-        _deep_get(data, ["thresholds", "limits_overcommit_ratio"], t.limits_overcommit_ratio)
-    )
-
-    t.node_cpu_utilization = _env_float("MCP_THRESHOLD_NODE_CPU_UTILIZATION", t.node_cpu_utilization)
-    t.node_memory_utilization = _env_float(
-        "MCP_THRESHOLD_NODE_MEMORY_UTILIZATION", t.node_memory_utilization
-    )
-    t.pod_restart_count = _env_int("MCP_THRESHOLD_POD_RESTART_COUNT", t.pod_restart_count)
-    t.requests_overcommit_ratio = _env_float(
-        "MCP_THRESHOLD_REQUESTS_OVERCOMMIT_RATIO", t.requests_overcommit_ratio
-    )
-    t.limits_overcommit_ratio = _env_float("MCP_THRESHOLD_LIMITS_OVERCOMMIT_RATIO", t.limits_overcommit_ratio)
-
-    return cfg
-
-
-_CONFIG_CACHE: InspectorConfig | None = None
-_CONFIG_CACHE_LOCK = threading.Lock()
-
-
-def _get_runtime_config() -> InspectorConfig:
-    """
-    读取 MCP Server 运行配置（缓存，首次调用时构建）。
-
-    优先级：
-    1) MCP_CONFIG（JSON/YAML）
-    2) 环境变量（MCP_THRESHOLD_*）
-    3) 内置默认值
-    """
-    global _CONFIG_CACHE
-    if _CONFIG_CACHE is not None:
-        return _CONFIG_CACHE
-    with _CONFIG_CACHE_LOCK:
-        if _CONFIG_CACHE is not None:
-            return _CONFIG_CACHE
-        _CONFIG_CACHE = _build_runtime_config()
-        return _CONFIG_CACHE
-
-
-def init_k8s_client() -> MCPKubeClients:
-    """
-    初始化 MCP Server 使用的 Kubernetes 客户端。
-
-    环境变量：
-    - MCP_K8S_IN_CLUSTER=true/false
-    - MCP_K8S_KUBECONFIG=/path/to/config
-    - MCP_K8S_CONTEXT=xxx
-    - MCP_K8S_VERIFY_SSL=true/false
-    """
-
-    # 双模式兼容：既支持本地 kubeconfig，也支持集群内 ServiceAccount。
-    in_cluster = _env_bool("MCP_K8S_IN_CLUSTER", False)
-    kubeconfig = (os.getenv("MCP_K8S_KUBECONFIG") or "").strip() or None
-    context = (os.getenv("MCP_K8S_CONTEXT") or "").strip() or None
-
-    # 证书校验开关：默认开启；教学/测试环境可显式设为 false。
-    verify_ssl = _env_bool("MCP_K8S_VERIFY_SSL", True)
-
-    if in_cluster:
-        config.load_incluster_config()
-        display_name = "in-cluster"
+def init_k8s_client(settings=None) -> MCPKubeClients:
+    settings = settings or load_settings(os.environ)
+    cfg = client.Configuration()
+    if settings.in_cluster:
+        config.load_incluster_config(client_configuration=cfg)
     else:
-        config.load_kube_config(config_file=kubeconfig, context=context)
-        display_name = context or "kubeconfig"
-
-    cfg = client.Configuration.get_default_copy()
-    cfg.verify_ssl = verify_ssl
+        config.load_kube_config(config_file=settings.kubeconfig, context=settings.context, client_configuration=cfg)
+    cfg.verify_ssl = settings.verify_ssl
+    cfg.retries = 0
+    cfg.connection_pool_maxsize = settings.api_max_in_flight
     api_client = client.ApiClient(cfg)
-    return MCPKubeClients(
-        display_name=display_name,
-        api_client=api_client,
-        core=client.CoreV1Api(api_client),
-        custom=client.CustomObjectsApi(api_client),
-    )
+    return MCPKubeClients("in-cluster" if settings.in_cluster else settings.context or "kubeconfig",
+                          api_client,client.CoreV1Api(api_client),client.CustomObjectsApi(api_client))
 
 
-_K8S_CLIENTS: MCPKubeClients | None = None
-_K8S_CLIENTS_LOCK = threading.Lock()
+class K8sGateway:
+    def __init__(self, settings: K8sSettings, *, client_factory=None, clock=time.monotonic):
+        self.settings, self.clock = settings, clock
+        self._factory = client_factory or (lambda:init_k8s_client(settings))
+        self._clients = None
+        self._lock = threading.Lock()
+        self._closed = False
+        self.limiter = TokenBucketLimiter(settings.api_rps,settings.api_burst,settings.api_max_in_flight,
+                         queue_timeout=settings.queue_timeout_seconds,enabled=settings.rate_limit_enabled,clock=clock)
+
+    @property
+    def clients(self):
+        with self._lock:
+            if self._closed:
+                raise K8sOperationError("BUSY", "K8s gateway is closed")
+            if self._clients is None:
+                self._clients = self._factory()
+            return self._clients
+
+    def call(self, fn, *args, deadline, **kwargs):
+        self.limiter.acquire(deadline=deadline)
+        try:
+            remaining = deadline-self.clock()
+            if remaining <= 0:
+                raise K8sOperationError("TIMEOUT", "Operation deadline exceeded")
+            kwargs["_request_timeout"] = (min(self.settings.connect_timeout_seconds,remaining),
+                                          min(self.settings.read_timeout_seconds,remaining))
+            return fn(*args,**kwargs)
+        except ApiException as exc:
+            code = {401:"AUTH_FAILED",403:"PERMISSION_DENIED",404:"NOT_FOUND",429:"BUSY"}.get(exc.status,"COMMAND_FAILED")
+            raise K8sOperationError(code,"Kubernetes API request failed") from exc
+        except (TimeoutError, ReadTimeoutError):
+            raise K8sOperationError("TIMEOUT", "Kubernetes API timed out") from None
+        except (OSError, HTTPError):
+            raise K8sOperationError("UNREACHABLE", "Kubernetes API unavailable") from None
+        finally:
+            self.limiter.release()
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            if self._clients is not None:
+                self._clients.api_client.close()
 
 
-def _get_k8s_clients() -> MCPKubeClients:
-    global _K8S_CLIENTS
-    if _K8S_CLIENTS is not None:
-        return _K8S_CLIENTS
-    with _K8S_CLIENTS_LOCK:
-        if _K8S_CLIENTS is not None:
-            return _K8S_CLIENTS
-        _K8S_CLIENTS = init_k8s_client()
-        logger.info("K8s client initialized: %s", _K8S_CLIENTS.display_name)
-        return _K8S_CLIENTS
+_GATEWAY = None
+_GATEWAY_CONTEXT = ContextVar("k8s_gateway", default=None)
+_DEADLINE = ContextVar("k8s_deadline", default=None)
+_COVERAGE = ContextVar("k8s_coverage", default=None)
+
+
+def _get_gateway():
+    global _GATEWAY
+    if _GATEWAY_CONTEXT.get() is not None:
+        return _GATEWAY_CONTEXT.get()
+    if _GATEWAY is None:
+        _GATEWAY = K8sGateway(load_settings(os.environ))
+    return _GATEWAY
+
+
+def _get_k8s_clients():
+    return _get_gateway().clients
+
+
+def _get_runtime_config():
+    return InspectorConfig(_get_gateway().settings.thresholds)
+
+
+def _k8s_api_call(fn, *args, **kwargs):
+    gateway = _get_gateway()
+    return gateway.call(fn,*args,deadline=_DEADLINE.get() or gateway.clock()+gateway.settings.tool_timeout_seconds,**kwargs)
+
+
+def _mark_incomplete(warning):
+    coverage = _COVERAGE.get()
+    if coverage is not None:
+        coverage["complete"] = False
+        if warning not in coverage["warnings"]:
+            coverage["warnings"].append(warning)
+
+
+def _k8s_tool(fn):
+    @wraps(fn)
+    def wrapped(*args,**kwargs):
+        gateway = _get_gateway()
+        token = _DEADLINE.set(gateway.clock()+gateway.settings.tool_timeout_seconds)
+        coverage = {"complete":True,"warnings":[]}
+        state = _COVERAGE.set(coverage)
+        request_id = str(uuid4())
+        try:
+            try:
+                result = fn(*args,**kwargs)
+            except K8sOperationError as exc:
+                result = {"ok":False,"error":str(exc),"error_code":exc.code,"complete":False}
+            except config.ConfigException:
+                result = {"ok":False,"error":"Kubernetes configuration is unavailable","error_code":"CONFIG_ERROR","complete":False}
+            result.setdefault("ok","error" not in result)
+            result["complete"] = result.get("complete",True) and coverage["complete"]
+            result["warnings"] = list(dict.fromkeys(result.get("warnings",[])+coverage["warnings"]))
+            result.update(request_id=request_id,timestamp=datetime.now(timezone.utc).isoformat())
+            logger.info("tool=%s request_id=%s complete=%s",fn.__name__,request_id,result["complete"])
+            return result
+        finally:
+            _DEADLINE.reset(token)
+            _COVERAGE.reset(state)
+    return wrapped
 
 
 def _now_utc() -> datetime:
@@ -809,6 +799,7 @@ def _pod_suggestions(issue: str | None, phase: str) -> list[str]:
         "openWorldHint": True,
     }
 )
+@_k8s_tool
 def list_nodes(
     label_selector: Annotated[
         str | None,
@@ -835,6 +826,7 @@ def list_nodes(
         "openWorldHint": True,
     }
 )
+@_k8s_tool
 def get_node_detail(
     node_name: Annotated[str, Field(description="节点名称")],
 ) -> dict[str, Any]:
@@ -859,6 +851,7 @@ def get_node_detail(
         "openWorldHint": True,
     }
 )
+@_k8s_tool
 def get_node_resource_usage(
     node_name: Annotated[str, Field(description="节点名称")],
 ) -> dict[str, Any]:
@@ -998,6 +991,7 @@ def get_node_resource_usage(
         "openWorldHint": True,
     }
 )
+@_k8s_tool
 def find_problem_nodes(
     label_selector: Annotated[
         str | None,
@@ -1046,6 +1040,7 @@ def find_problem_nodes(
         "openWorldHint": True,
     }
 )
+@_k8s_tool
 def list_node_pods(
     node_name: Annotated[str, Field(description="节点名称")],
 ) -> dict[str, Any]:
@@ -1113,6 +1108,7 @@ def _read_pod_log_excerpt(
         "openWorldHint": True,
     }
 )
+@_k8s_tool
 def diagnose_pod_issues(
     pod_name: Annotated[str, Field(description="Pod 名称")],
     namespace: Annotated[str, Field(description="Pod 所在命名空间")],
@@ -1172,6 +1168,7 @@ def diagnose_pod_issues(
         "openWorldHint": True,
     }
 )
+@_k8s_tool
 def health_check() -> dict[str, Any]:
     """验证 MCP Server 与 K8s API 的连接状态。"""
     try:
@@ -1188,6 +1185,7 @@ def health_check() -> dict[str, Any]:
 
 
 @mcp.resource("k8s://cluster/summary")
+@_k8s_tool
 def cluster_summary() -> dict[str, Any]:
     """提供一个轻量级集群摘要，便于 LLM 在开始诊断前快速建立上下文。"""
 
@@ -1259,15 +1257,20 @@ def cluster_problem_scan_prompt() -> str:
 """
 
 
-def main() -> None:
-    """直接运行 MCP Server。"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s [k8s-check-mcp] %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
-    logger.info("Starting K8s Check MCP Server on 0.0.0.0:8080")
-    mcp.run(transport="sse", host="0.0.0.0", port=8080)
+def main(argv=None, *, default_transport="sse"):
+    settings = load_settings(os.environ)
+    parser = argparse.ArgumentParser(description="AstroMCP read-only Kubernetes inspection")
+    parser.add_argument("--transport",choices=("stdio","http","sse"),default=os.environ.get("MCP_TRANSPORT",default_transport))
+    parser.add_argument("--host",default=settings.bind_host)
+    parser.add_argument("--port",type=int,default=settings.bind_port)
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO)
+    if args.transport != "stdio":
+        if args.host != "localhost" and not ipaddress.ip_address(args.host).is_loopback:
+            raise ValueError("Only loopback HTTP/SSE is supported")
+        mcp.run(transport=args.transport,host=args.host,port=args.port)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
