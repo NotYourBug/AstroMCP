@@ -5,19 +5,27 @@ SRE Operations MCP Server — 系统资源监控工具集
 支持本地及跨主机(SSH)的磁盘、内存、CPU、TCP 连接监控，以及端口和主机连通性检测。
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
+import ipaddress
 import json
 import logging
+import os
 import platform
 import re
+import shlex
 import socket
+from pathlib import Path
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 import paramiko
 import psutil
 from fastmcp import FastMCP
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ==================== 日志配置 ====================
 
@@ -38,6 +46,72 @@ TCP_CHECK_TIMEOUT = 5
 # ==================== 初始化 ====================
 
 mcp = FastMCP("sre-ops-server")
+
+
+class HostSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    tool_timeout_seconds: float = Field(default=30, gt=0)
+    queue_timeout_seconds: float = Field(default=2, ge=0)
+    ssh_connect_timeout_seconds: float = Field(default=8, gt=0)
+    ssh_command_timeout_seconds: float = Field(default=15, gt=0)
+    ssh_max_in_flight: int = Field(default=4, ge=1)
+    ssh_max_per_target: int = Field(default=2, ge=1)
+    ssh_output_limit_bytes: int = Field(default=262144, ge=1)
+    ssh_known_hosts: str | None = None
+    disk_threshold: int = Field(default=85, ge=0, le=100)
+    transport: str = "stdio"
+    bind_host: str = "127.0.0.1"
+    bind_port: int = Field(default=8081, ge=1, le=65535)
+
+    @model_validator(mode="after")
+    def validate_queue(self):
+        if self.queue_timeout_seconds >= self.tool_timeout_seconds:
+            raise ValueError("queue timeout must be less than tool timeout")
+        return self
+
+
+def load_settings(environ: Mapping[str, str], config_path: Path | None = None) -> HostSettings:
+    path = config_path or (Path(environ["MCP_CONFIG"]) if environ.get("MCP_CONFIG") else None)
+    data = json.loads(path.read_text(encoding="utf-8")) if path else {}
+    if not isinstance(data, dict):
+        raise ValueError("configuration must be an object")
+    names = {
+        "MCP_TOOL_TIMEOUT_SECONDS": "tool_timeout_seconds",
+        "MCP_QUEUE_TIMEOUT_SECONDS": "queue_timeout_seconds",
+        "MCP_SSH_CONNECT_TIMEOUT_SECONDS": "ssh_connect_timeout_seconds",
+        "MCP_SSH_COMMAND_TIMEOUT_SECONDS": "ssh_command_timeout_seconds",
+        "MCP_SSH_MAX_IN_FLIGHT": "ssh_max_in_flight",
+        "MCP_SSH_MAX_PER_TARGET": "ssh_max_per_target",
+        "MCP_SSH_OUTPUT_LIMIT_BYTES": "ssh_output_limit_bytes",
+        "MCP_SSH_KNOWN_HOSTS": "ssh_known_hosts",
+        "MCP_DISK_THRESHOLD": "disk_threshold",
+        "MCP_TRANSPORT": "transport", "MCP_BIND_HOST": "bind_host", "MCP_BIND_PORT": "bind_port",
+    }
+    data.update({field: environ[key] for key, field in names.items() if key in environ})
+    return HostSettings.model_validate(data)
+
+
+def build_unix_disk_command(path: str) -> str:
+    if not path.startswith("/") or any(c in path for c in "\r\n\0"):
+        raise ValueError("Unix disk path must be absolute without control characters")
+    return f"df -kP {shlex.quote(path)}"
+
+
+def build_windows_disk_command(path: str) -> str:
+    if not re.fullmatch(r"[A-Za-z]:(?:[\\/][^\r\n\0]*)?", path):
+        raise ValueError("Windows disk path must have an explicit drive letter")
+    drive = path[0].upper()
+    return ('powershell -NoProfile -Command "'
+            f'Get-Volume -DriveLetter {drive} | Select-Object Size, SizeRemaining | ConvertTo-Json"')
+
+
+def create_ssh_client(settings: HostSettings):
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    if settings.ssh_known_hosts:
+        client.load_host_keys(settings.ssh_known_hosts)
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    return client
 
 # ==================== 输入校验 ====================
 
@@ -64,7 +138,7 @@ def _check_path(path: str) -> Optional[str]:
     """校验路径，合法返回 None，否则返回错误信息"""
     if not path or not path.strip():
         return "path 不能为空"
-    if HOST_FORBIDDEN.search(path):
+    if any(c in path for c in "\r\n\0"):
         return f"path 包含非法字符: {path}"
     return None
 
@@ -112,11 +186,7 @@ async def run_remote_command(
         if not username:
             return -1, "", "远程执行需要提供 SSH username"
 
-        client = paramiko.SSHClient()
-        # 注意: AutoAddPolicy 接受未知主机密钥，存在中间人攻击风险。
-        # 该工具面向内网运维场景，在不受信任的网络中应改用 RejectPolicy
-        # 并预先配置 known_hosts。
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client = create_ssh_client(load_settings(os.environ))
 
         try:
             client.connect(
@@ -248,7 +318,7 @@ async def check_disk_usage(
     host: Annotated[str, Field(description="目标主机 IP 或域名（本机传 127.0.0.1）)")] = "127.0.0.1",
     path: Annotated[str, Field(description="要检查的磁盘路径（如 / 或 C:）")] = "/",
     threshold: Annotated[
-        int, Field(description=f"磁盘使用率告警阈值，默认 {DEFAULT_DISK_THRESHOLD}%")
+        int, Field(ge=0, le=100, description=f"磁盘使用率告警阈值，默认 {DEFAULT_DISK_THRESHOLD}%")
     ] = DEFAULT_DISK_THRESHOLD,
     username: Annotated[Optional[str], Field(description="SSH 用户名（仅远程需要）")] = None,
     password: Annotated[Optional[str], Field(description="SSH 密码（仅远程需要）")] = None,
@@ -296,7 +366,7 @@ async def check_disk_usage(
 async def _disk_unix(host, port, username, password, key_path, path, threshold) -> dict:
     """Unix (Linux/macOS) 磁盘检查 — 使用 df -kP"""
     status, out, err = await run_remote_command(
-        host, port, username, password, key_path, f"df -kP {path}"
+        host, port, username, password, key_path, build_unix_disk_command(path)
     )
     if status != 0:
         return _err(host, "执行 df 命令失败", detail=err or out)
@@ -332,12 +402,8 @@ async def _disk_unix(host, port, username, password, key_path, path, threshold) 
 
 async def _disk_windows(host, port, username, password, key_path, path, threshold) -> dict:
     """Windows 磁盘检查 — 使用 PowerShell Get-Volume"""
-    drive = path[0].upper() if path and path[0].isalpha() else "C"
-    cmd = (
-        f'powershell -NoProfile -Command "'
-        f"Get-Volume -DriveLetter {drive} | "
-        f'Select-Object Size, SizeRemaining | ConvertTo-Json"'
-    )
+    cmd = build_windows_disk_command(path)
+    drive = path[0].upper()
     status, out, err = await run_remote_command(host, port, username, password, key_path, cmd)
     if status != 0:
         return _err(host, "执行 PowerShell Get-Volume 失败", detail=err or out)
@@ -694,3 +760,22 @@ async def check_service_port(
     except Exception as e:
         logger.exception("端口检查异常 %s:%d", host, port)
         return _err(host, f"端口检查异常: {e}")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    settings = load_settings(os.environ)
+    parser = argparse.ArgumentParser(description="AstroMCP host inspection (trusted local operator)")
+    parser.add_argument("--transport", choices=("stdio", "http", "sse"), default=settings.transport)
+    parser.add_argument("--host", default=settings.bind_host)
+    parser.add_argument("--port", type=int, default=settings.bind_port)
+    args = parser.parse_args(argv)
+    if args.transport != "stdio":
+        if args.host != "localhost" and not ipaddress.ip_address(args.host).is_loopback:
+            raise ValueError("Only loopback HTTP/SSE is supported; remote authentication is not configured")
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
+    else:
+        mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
