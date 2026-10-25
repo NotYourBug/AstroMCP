@@ -17,6 +17,13 @@ import platform
 import re
 import shlex
 import socket
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import wraps
+from uuid import uuid4
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -113,6 +120,171 @@ def create_ssh_client(settings: HostSettings):
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
     return client
 
+
+@dataclass(frozen=True)
+class SSHConnection:
+    host: str
+    port: int
+    username: str
+    password: str | None = field(default=None, repr=False)
+    key_path: str | None = None
+
+
+@dataclass
+class CommandResult:
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    error_code: str | None = None
+    complete: bool = True
+
+
+class SSHExecutor:
+    """Bounded blocking workers; a cancelled waiter never frees a running worker's lease."""
+
+    def __init__(self, settings: HostSettings, *, client_factory=None, clock=time.monotonic):
+        self.settings, self.clock = settings, clock
+        self.client_factory = client_factory or (lambda: create_ssh_client(settings))
+        self._pool = ThreadPoolExecutor(max_workers=settings.ssh_max_in_flight, thread_name_prefix="astromcp-ssh")
+        self._sem = threading.BoundedSemaphore(settings.ssh_max_in_flight)
+        self._lock = threading.Lock()
+        self._targets = {}
+        self._active = {}
+        self._closed = False
+
+    async def execute(self, connection: SSHConnection, command: str, *, deadline: float) -> CommandResult:
+        if not connection.username:
+            return CommandResult(error_code="INVALID_INPUT", complete=False)
+        key = (connection.host, connection.port, connection.username)
+        queue_end = min(deadline, self.clock() + self.settings.queue_timeout_seconds)
+        while not self._closed:
+            if self.clock() >= queue_end:
+                return CommandResult(error_code="BUSY", complete=False)
+            if self._sem.acquire(blocking=False):
+                with self._lock:
+                    entry = self._targets.setdefault(key, [threading.BoundedSemaphore(self.settings.ssh_max_per_target), 0])
+                    if entry[0].acquire(blocking=False):
+                        entry[1] += 1
+                        break
+                    if entry[1] == 0:
+                        self._targets.pop(key, None)
+                self._sem.release()
+            await asyncio.sleep(.005)
+        else:
+            return CommandResult(error_code="BUSY", complete=False)
+        stop, holder = threading.Event(), []
+        future = self._pool.submit(self._run, connection, command, deadline, stop, holder)
+        with self._lock:
+            self._active[future] = (stop, holder)
+
+        def finished(done):
+            with self._lock:
+                self._active.pop(done, None)
+                entry[1] -= 1
+                if entry[1] == 0:
+                    self._targets.pop(key, None)
+            entry[0].release()
+            self._sem.release()
+
+        future.add_done_callback(finished)
+        wrapped = asyncio.wrap_future(future)
+        try:
+            return await asyncio.wait_for(asyncio.shield(wrapped), max(deadline-self.clock(), .001))
+        except (TimeoutError, asyncio.TimeoutError):
+            self._abort(stop, holder)
+            return CommandResult(error_code="TIMEOUT", complete=False)
+        except asyncio.CancelledError:
+            self._abort(stop, holder)
+            raise
+
+    @staticmethod
+    def _abort(stop, holder):
+        stop.set()
+        for client in holder:
+            client.close()
+
+    def _run(self, connection, command, deadline, stop, holder):
+        client = channel = None
+        out, err = bytearray(), bytearray()
+
+        def remaining(end):
+            value = end-self.clock()
+            if stop.is_set() or value <= 0:
+                raise TimeoutError
+            return value
+
+        try:
+            client = self.client_factory()
+            holder.append(client)
+            timeout = min(remaining(deadline), self.settings.ssh_connect_timeout_seconds)
+            client.connect(hostname=connection.host, port=connection.port, username=connection.username,
+                           password=connection.password, key_filename=connection.key_path,
+                           allow_agent=True, look_for_keys=True, timeout=timeout,
+                           banner_timeout=timeout, auth_timeout=timeout)
+            end = min(deadline, self.clock()+self.settings.ssh_command_timeout_seconds)
+            stdin, stdout, _ = client.exec_command(command, timeout=remaining(end))
+            stdin.close()
+            channel = stdout.channel
+            while True:
+                remaining(end)
+                for ready, recv, buffer in ((channel.recv_ready, channel.recv, out),
+                                             (channel.recv_stderr_ready, channel.recv_stderr, err)):
+                    if ready():
+                        buffer.extend(recv(32768))
+                        if len(out)+len(err) > self.settings.ssh_output_limit_bytes:
+                            return CommandResult(error_code="OUTPUT_LIMIT", complete=False)
+                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                    code = channel.recv_exit_status()
+                    return CommandResult(code, out.decode("utf-8", errors="replace").strip(),
+                                         err.decode("utf-8", errors="replace").strip())
+                time.sleep(.005)
+        except paramiko.BadHostKeyException:
+            return CommandResult(error_code="HOST_KEY_CHANGED", complete=False)
+        except paramiko.AuthenticationException:
+            return CommandResult(error_code="AUTH_FAILED", complete=False)
+        except (TimeoutError, asyncio.TimeoutError):
+            return CommandResult(error_code="TIMEOUT", complete=False)
+        except paramiko.SSHException as exc:
+            code = "HOST_KEY_UNKNOWN" if "known_hosts" in str(exc) else "UNREACHABLE"
+            return CommandResult(error_code=code, complete=False)
+        except OSError:
+            return CommandResult(error_code="UNREACHABLE", complete=False)
+        finally:
+            if channel is not None:
+                channel.close()
+            if client is not None:
+                client.close()
+
+    async def aclose(self):
+        self._closed = True
+        with self._lock:
+            active = list(self._active.items())
+        for _, (stop, holder) in active:
+            self._abort(stop, holder)
+        if active:
+            await asyncio.wait([asyncio.wrap_future(f) for f, _ in active], timeout=1)
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+_EXECUTOR = None
+_TOOL_DEADLINE = ContextVar("host_deadline", default=None)
+_REQUEST_ID = ContextVar("host_request_id", default=None)
+
+
+def _host_tool(fn):
+    @wraps(fn)
+    async def wrapped(*args, **kwargs):
+        token = _TOOL_DEADLINE.set(time.monotonic()+load_settings(os.environ).tool_timeout_seconds)
+        request = _REQUEST_ID.set(str(uuid4()))
+        try:
+            return await fn(*args, **kwargs)
+        except ValueError as exc:
+            return _err(kwargs.get("host", ""), str(exc), error_code="INVALID_INPUT")
+        finally:
+            _TOOL_DEADLINE.reset(token)
+            _REQUEST_ID.reset(request)
+    return wrapped
+
 # ==================== 输入校验 ====================
 
 HOST_FORBIDDEN = re.compile(r"[;&|`$(){}\[\]<>'\"]")
@@ -157,75 +329,30 @@ def _now_iso() -> str:
 
 def _ok(**kwargs) -> dict:
     """构建成功结果，自动附加时间戳"""
-    result = {"ok": True, "timestamp": _now_iso()}
+    result = {"ok": True, "timestamp": _now_iso(), "complete": True, "warnings": [],
+              "request_id": _REQUEST_ID.get() or str(uuid4())}
     result.update(kwargs)
     return result
 
 
 def _err(host: str, error: str, **extra) -> dict:
     """构建错误结果，自动附加时间戳"""
-    result = {"ok": False, "host": host, "error": error, "timestamp": _now_iso()}
+    result = {"ok": False, "host": host, "error": error, "timestamp": _now_iso(),
+              "complete": False, "warnings": [], "error_code": "COMMAND_FAILED",
+              "request_id": _REQUEST_ID.get() or str(uuid4())}
     result.update(extra)
     return result
 
 
-async def run_remote_command(
-    host: str,
-    port: int,
-    username: Optional[str],
-    password: Optional[str],
-    key_path: Optional[str],
-    command: str,
-) -> tuple[int, str, str]:
-    """
-    通过 SSH 在远程主机执行命令。
-    返回 (exit_status, stdout, stderr) — exit_status 为 -1 表示连接层错误。
-    """
-
-    def _run() -> tuple[int, str, str]:
-        if not username:
-            return -1, "", "远程执行需要提供 SSH username"
-
-        client = create_ssh_client(load_settings(os.environ))
-
-        try:
-            client.connect(
-                hostname=host,
-                port=port,
-                username=username,
-                password=password,
-                key_filename=key_path,
-                allow_agent=True,
-                look_for_keys=True,
-                timeout=SSH_CONNECT_TIMEOUT,
-                banner_timeout=SSH_CONNECT_TIMEOUT,
-                auth_timeout=SSH_CONNECT_TIMEOUT,
-            )
-
-            _, stdout, stderr = client.exec_command(command, timeout=SSH_COMMAND_TIMEOUT)
-            exit_status = stdout.channel.recv_exit_status()
-            out = stdout.read().decode("utf-8", errors="ignore").strip()
-            err = stderr.read().decode("utf-8", errors="ignore").strip()
-
-            logger.info("ssh %s@%s:%d cmd=%r → exit=%d", username, host, port, command, exit_status)
-            if exit_status != 0:
-                logger.warning("ssh cmd failed: %s", err or out)
-
-            return exit_status, out, err
-
-        except paramiko.AuthenticationException as e:
-            logger.error("ssh 认证失败 %s@%s:%d — %s", username, host, port, e)
-            return -1, "", f"认证失败: {e}"
-        except (paramiko.SSHException, socket.error) as e:
-            logger.error("ssh 连接异常 %s@%s:%d — %s", username, host, port, e)
-            return -1, "", f"SSH 连接异常: {e}"
-        except Exception as e:
-            logger.error("ssh 未知错误 %s@%s:%d — %s", username, host, port, e)
-            return -1, "", str(e)
-        finally:
-            client.close()
-
-    return await asyncio.to_thread(_run)
+async def run_remote_command(host, port, username, password, key_path, command) -> tuple[int, str, str]:
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        _EXECUTOR = SSHExecutor(load_settings(os.environ))
+    deadline = _TOOL_DEADLINE.get() or time.monotonic()+load_settings(os.environ).tool_timeout_seconds
+    result = await _EXECUTOR.execute(SSHConnection(host, port, username or "", password, key_path), command, deadline=deadline)
+    if result.error_code:
+        return -1, "", result.error_code
+    return result.exit_code, result.stdout, result.stderr
 
 
 async def detect_remote_os(
@@ -250,6 +377,9 @@ async def detect_remote_os(
         logger.info("检测到远端 %s 为 %s", host, os_type)
         return os_type, ""
 
+    if status == -1:
+        return None, err
+
     w_status, w_out, w_err = await run_remote_command(
         host, port, username, password, key_path, "cmd.exe /c ver"
     )
@@ -264,6 +394,7 @@ async def detect_remote_os(
 
 
 @mcp.tool()
+@_host_tool
 async def check_host_status(
     hostname: Annotated[str, Field(description="主机名或 IP 地址")],
 ) -> dict:
@@ -314,6 +445,7 @@ def _parse_ping_summary(output: str) -> Optional[str]:
 
 
 @mcp.tool()
+@_host_tool
 async def check_disk_usage(
     host: Annotated[str, Field(description="目标主机 IP 或域名（本机传 127.0.0.1）)")] = "127.0.0.1",
     path: Annotated[str, Field(description="要检查的磁盘路径（如 / 或 C:）")] = "/",
@@ -429,6 +561,7 @@ async def _disk_windows(host, port, username, password, key_path, path, threshol
 
 
 @mcp.tool()
+@_host_tool
 async def check_mem(
     host: Annotated[str, Field(description="目标主机 IP 或域名")] = "127.0.0.1",
     username: Annotated[Optional[str], Field(description="SSH 用户名")] = None,
@@ -594,6 +727,7 @@ async def _mem_windows(host, port, username, password, key_path) -> dict:
 
 
 @mcp.tool()
+@_host_tool
 async def check_cpu(
     host: Annotated[str, Field(description="目标主机 IP 或域名")] = "127.0.0.1",
     username: Annotated[Optional[str], Field(description="SSH 用户名")] = None,
@@ -679,6 +813,7 @@ async def _cpu_windows(host, port, username, password, key_path) -> dict:
 
 
 @mcp.tool()
+@_host_tool
 async def check_tcp(
     host: Annotated[str, Field(description="目标主机 IP 或域名")] = "127.0.0.1",
     username: Annotated[Optional[str], Field(description="SSH 用户名")] = None,
@@ -728,6 +863,7 @@ async def _tcp_remote(os_type, host, port, username, password, key_path) -> dict
 
 
 @mcp.tool()
+@_host_tool
 async def check_service_port(
     host: Annotated[str, Field(description="主机名或 IP 地址")],
     port: Annotated[int, Field(description="端口号")],
