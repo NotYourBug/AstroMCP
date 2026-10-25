@@ -42,6 +42,8 @@ from functools import wraps
 from uuid import uuid4
 import argparse, ipaddress
 from urllib3.exceptions import HTTPError, ReadTimeoutError
+from decimal import Decimal, ROUND_CEILING, InvalidOperation
+from kubernetes.utils.quantity import parse_quantity as sdk_parse_quantity
 
 # MCP Server 主对象：用于注册 tools/resources/prompts，并对外运行协议服务。
 mcp = FastMCP("K8s Check MCP")
@@ -258,7 +260,21 @@ class K8sGateway:
                 raise K8sOperationError("TIMEOUT", "Operation deadline exceeded")
             kwargs["_request_timeout"] = (min(self.settings.connect_timeout_seconds,remaining),
                                           min(self.settings.read_timeout_seconds,remaining))
-            return fn(*args,**kwargs)
+            name=getattr(fn,"__name__","")
+            preserve=name in {"read_namespaced_pod","list_pod_for_all_namespaces"}
+            if preserve:kwargs["_preload_content"]=False
+            response=fn(*args,**kwargs)
+            if preserve and isinstance(getattr(response,"data",None),(bytes,str)):
+                try:
+                    raw=json.loads(response.data)
+                    result=self.clients.api_client.deserialize(response,"V1Pod" if name=="read_namespaced_pod" else "V1PodList")
+                    if name=="read_namespaced_pod":result._astromcp_raw=raw
+                    else:
+                        for pod,item in zip(result.items,raw.get("items",[])):pod._astromcp_raw=item
+                    return result
+                finally:
+                    response.release_conn()
+            return response
         except ApiException as exc:
             code = {401:"AUTH_FAILED",403:"PERMISSION_DENIED",404:"NOT_FOUND",429:"BUSY"}.get(exc.status,"COMMAND_FAILED")
             raise K8sOperationError(code,"Kubernetes API request failed") from exc
@@ -439,38 +455,129 @@ _BINARY = {
 }
 
 
+def parse_quantity_decimal(text: str) -> Decimal:
+    text=str(text).strip()
+    if not text or len(text)>128:
+        raise ValueError("Invalid resource quantity")
+    try:
+        value = sdk_parse_quantity(text)
+    except (ValueError,InvalidOperation,OverflowError) as exc:
+        raise ValueError("Invalid resource quantity") from exc
+    if not value.is_finite() or value<0 or value>Decimal(2**63-1):
+        raise ValueError("Resource quantity is outside the supported range")
+    return value
+
+
+def cpu_to_millicores(text: str) -> int:
+    return int((parse_quantity_decimal(text)*1000).to_integral_value(rounding=ROUND_CEILING))
+
+
+def memory_to_bytes(text: str) -> int:
+    return int(parse_quantity_decimal(text).to_integral_value(rounding=ROUND_CEILING))
+
+
+@dataclass
+class PodResources:
+    cpu_request_m: int = 0
+    memory_request_bytes: int = 0
+    cpu_limit_m: int | None = None
+    memory_limit_bytes: int | None = None
+    complete: bool = True
+    warnings: list[str] = field(default_factory=list)
+    configured_cpu_limit_m: int = 0
+    configured_memory_limit_bytes: int = 0
+
+
+def _resource_pair(resources, section):
+    values=_value(resources,section) or {}
+    return (cpu_to_millicores(str(_value(values,"cpu","0"))),memory_to_bytes(str(_value(values,"memory","0"))))
+
+
+def _add_pair(a,b):
+    return tuple(None if x is None or y is None else x+y for x,y in zip(a,b))
+
+
+def _max_pair(a,b):
+    return tuple(None if x is None or y is None else max(x,y) for x,y in zip(a,b))
+
+
+def _container_pair(container,section,configured=False):
+    resources=_value(container,"resources")
+    pair=_resource_pair(resources,section)
+    if section=="requests" or configured:
+        return pair
+    values=_value(resources,"limits") or {}
+    return tuple(value if _value(values,key) is not None and value>0 else None
+                 for key,value in zip(("cpu","memory"),pair))
+
+
+def _effective_pair(spec,section,configured=False):
+    app=(0,0)
+    for container in (_value(spec,"containers") or []):
+        app=_add_pair(app,_container_pair(container,section,configured))
+    running,peak=(0,0),(0,0)
+    for container in (_value(spec,"init_containers") or []):
+        pair=_container_pair(container,section,configured)
+        if _value(container,"restart_policy")=="Always":
+            running=_add_pair(running,pair)
+            stage=running
+        else:
+            stage=_add_pair(running,pair)
+        peak=_max_pair(peak,stage)
+    effective=_max_pair(peak,_add_pair(app,running))
+    overhead=_value(spec,"overhead") or {}
+    extra=(cpu_to_millicores(str(_value(overhead,"cpu","0"))),memory_to_bytes(str(_value(overhead,"memory","0"))))
+    return _add_pair(effective,extra)
+
+
+def effective_resources(pod) -> PodResources:
+    raw=getattr(pod,"_astromcp_raw",None)
+    source=raw if raw is not None else pod
+    spec=_value(source,"spec")
+    warnings=[]
+    if spec is None or not _value(spec,"containers") or _value(spec,"resources"):
+        warnings.append("UNSUPPORTED_RESOURCE_MODEL")
+    status=_value(source,"status")
+    if _value(status,"resize"):
+        warnings.append("UNSUPPORTED_RESOURCE_MODEL")
+    declared={_value(c,"name"):_value(_value(c,"resources"),"requests") or {} for c in (_value(spec,"containers") or [])+(_value(spec,"init_containers") or [])}
+    for cs,_ in _container_statuses(source):
+        allocated=_value(cs,"allocated_resources") or _value(_value(cs,"resources"),"requests")
+        if allocated:
+            request=declared.get(_value(cs,"name"),{})
+            for resource in ("cpu","memory"):
+                value=_value(allocated,resource)
+                if value is not None and parse_quantity_decimal(value)!=parse_quantity_decimal(_value(request,resource,"0")):
+                    warnings.append("UNSUPPORTED_RESOURCE_MODEL")
+    req=_effective_pair(spec,"requests")
+    limit=_effective_pair(spec,"limits")
+    configured=_effective_pair(spec,"limits",True)
+    return PodResources(req[0],req[1],limit[0],limit[1],not warnings,list(dict.fromkeys(warnings)),configured[0],configured[1])
+
+
+def resource_advice(pods: list[dict], totals: dict) -> list[str]:
+    if not totals.get("requests_overcommit"):
+        return []
+    advice=[]
+    for resource in ("cpu_request_m","memory_request_bytes"):
+        contributors=sorted((pod for pod in pods if pod.get(resource,0)>0),key=lambda pod:(-pod[resource],pod.get("name","")))[:5]
+        if contributors:
+            advice.append(resource+" contributors: "+", ".join(f"{pod.get('namespace','')}/{pod['name']}={pod[resource]}" for pod in contributors))
+    advice.append("Review declared requests, actual usage and allocatable capacity before changing workloads.")
+    return advice
+
+
 def parse_quantity(q: str) -> float:
-    """
-    解析 K8s resource quantity 字符串为数值。
-
-    返回单位：
-    - cpu：以“核”为基准（m 表示 1e-3）
-    - memory：以“字节”为基准（Ki/Mi/Gi 等为 1024 进位）
-    """
-
-    s = (q or "").strip()
-    if not s:
-        return 0.0
-    for suf, mult in _BINARY.items():
-        if s.endswith(suf):
-            num_part = s[: -len(suf)]
-            return float(num_part) * mult if num_part else 0.0
-    for suf, mult in _DECIMAL.items():
-        if suf and s.endswith(suf):
-            num_part = s[: -len(suf)]
-            return float(num_part) * mult if num_part else 0.0
-    return float(s) if s else 0.0
+    return float(parse_quantity_decimal(q))
 
 
 
 def _cpu_to_millicores(quantity: str) -> int:
-    """把 K8s CPU quantity（如 250m/1）统一换算成 millicores（m）。"""
-    return int(round(parse_quantity(quantity) * 1000))
+    return cpu_to_millicores(quantity)
 
 
 def _memory_to_bytes(quantity: str) -> int:
-    """把 K8s 内存 quantity（如 128Mi/1Gi）统一换算成 bytes。"""
-    return int(round(parse_quantity(quantity)))
+    return memory_to_bytes(quantity)
 
 
 def _format_cpu_m(cpu_m: int) -> str:
@@ -491,11 +598,8 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{value:.1f}Ei"
 
 
-def _ratio(numerator: int, denominator: int) -> float:
-    """计算占比，避免除 0，并做 4 位小数截断。"""
-    if denominator <= 0:
-        return 0.0
-    return round(numerator / denominator, 4)
+def _ratio(numerator,denominator):
+    return round(numerator/denominator,4) if denominator>0 else None
 
 
 def _get_node_addresses(node: client.V1Node) -> dict[str, str]:
@@ -604,29 +708,8 @@ def _max_container_resources(containers: list[Any]) -> tuple[int, int, int, int]
     return max_cpu_req, max_cpu_lim, max_mem_req, max_mem_lim
 
 
-def _pod_effective_resources(pod: client.V1Pod) -> MCPPodResource:
-    """
-    计算单个 Pod 的有效 Requests/Limits。
-
-    调度视角下，InitContainer 采用 max(init) 与 sum(containers) 的组合逻辑。
-    """
-
-    containers = pod.spec.containers or []
-    init_containers = pod.spec.init_containers or []
-
-    c_req_cpu, c_lim_cpu, c_req_mem, c_lim_mem = _sum_container_resources(containers)
-    i_req_cpu, i_lim_cpu, i_req_mem, i_lim_mem = _max_container_resources(init_containers)
-
-    # K8s 调度口径：
-    # - 普通容器资源是 sum(containers)
-    # - initContainers 按串行执行，取每个 init container 在各资源维度上的最大值
-    # 有效资源 = max(sum(containers), max_per_init_container)
-    return MCPPodResource(
-        cpu_request_m=max(c_req_cpu, i_req_cpu),
-        cpu_limit_m=max(c_lim_cpu, i_lim_cpu),
-        memory_request_bytes=max(c_req_mem, i_req_mem),
-        memory_limit_bytes=max(c_lim_mem, i_lim_mem),
-    )
+def _pod_effective_resources(pod):
+    return effective_resources(pod)
 
 
 def _pod_restart_count(pod):
@@ -840,9 +923,9 @@ def evaluate_node(node, snapshot, settings):
             "cpu_utilization": cpu_ratio,
             "memory_utilization": mem_ratio,
         }
-        if cpu_ratio >= settings.thresholds.node_cpu_utilization:
+        if cpu_ratio is not None and cpu_ratio >= settings.thresholds.node_cpu_utilization:
             reasons.append("HighCPUUsage")
-        if mem_ratio >= settings.thresholds.node_memory_utilization:
+        if mem_ratio is not None and mem_ratio >= settings.thresholds.node_memory_utilization:
             reasons.append("HighMemoryUsage")
 
     return reasons, metric_detail
@@ -969,14 +1052,23 @@ def get_node_resource_usage(
     total_mem_lim_b = 0
     pod_breakdown: list[dict[str, Any]] = []
     best_effort_pods: list[dict[str, str]] = []
+    resources_complete = True
+    unbounded_cpu = unbounded_memory = False
+    contributors = []
 
     for pod in pods:
         # 逐 Pod 汇总 requests/limits，并保留有限数量的 breakdown 供 LLM 下钻。
         pod_res = _pod_effective_resources(pod)
+        resources_complete = resources_complete and pod_res.complete
+        for warning in pod_res.warnings:_mark_incomplete(warning)
+        unbounded_cpu = unbounded_cpu or pod_res.cpu_limit_m is None
+        unbounded_memory = unbounded_memory or pod_res.memory_limit_bytes is None
+        contributors.append({"name":_safe_name(pod),"namespace":_value(pod.metadata,"namespace","") or "",
+                             "cpu_request_m":pod_res.cpu_request_m,"memory_request_bytes":pod_res.memory_request_bytes})
         total_cpu_req_m += pod_res.cpu_request_m
-        total_cpu_lim_m += pod_res.cpu_limit_m
+        total_cpu_lim_m += pod_res.configured_cpu_limit_m
         total_mem_req_b += pod_res.memory_request_bytes
-        total_mem_lim_b += pod_res.memory_limit_bytes
+        total_mem_lim_b += pod_res.configured_memory_limit_bytes
 
         qos_class = _pod_qos_class(pod)
         if qos_class == "BestEffort":
@@ -994,9 +1086,9 @@ def get_node_resource_usage(
                     "name": getattr(pod.metadata, "name", "") or "",
                     "qos_class": qos_class,
                     "cpu_request_m": pod_res.cpu_request_m,
-                    "cpu_limit_m": pod_res.cpu_limit_m,
+                    "cpu_limit_m": pod_res.configured_cpu_limit_m,
                     "memory_request_bytes": pod_res.memory_request_bytes,
-                    "memory_limit_bytes": pod_res.memory_limit_bytes,
+                    "memory_limit_bytes": pod_res.configured_memory_limit_bytes,
                     "restart_count": _pod_restart_count(pod),
                 }
             )
@@ -1008,32 +1100,21 @@ def get_node_resource_usage(
 
     cpu_req_ratio = _ratio(total_cpu_req_m, alloc_cpu_m)
     mem_req_ratio = _ratio(total_mem_req_b, alloc_mem_b)
-    cpu_lim_ratio = _ratio(total_cpu_lim_m, alloc_cpu_m)
-    mem_lim_ratio = _ratio(total_mem_lim_b, alloc_mem_b)
+    cpu_lim_ratio = None if unbounded_cpu else _ratio(total_cpu_lim_m, alloc_cpu_m)
+    mem_lim_ratio = None if unbounded_memory else _ratio(total_mem_lim_b, alloc_mem_b)
 
+    audit_coverage = _COVERAGE.get()
+    audit_complete = audit_coverage is None or audit_coverage["complete"]
     metric_view = _node_metric_view(kube.custom, node_name)
     eviction_suggestion = None
-    requests_overcommit = (
-        cpu_req_ratio > cfg.thresholds.requests_overcommit_ratio
-        or mem_req_ratio > cfg.thresholds.requests_overcommit_ratio
-    )
-    limits_overcommit = (
-        cpu_lim_ratio > cfg.thresholds.limits_overcommit_ratio
-        or mem_lim_ratio > cfg.thresholds.limits_overcommit_ratio
-    )
-    limits_warning = None
-    if limits_overcommit:
-        limits_warning = {
-            "reason": "节点 Limits 水位偏高（软风险），建议结合实际负载与 QoS 分布评估是否需要扩容或做工作负载重平衡。",
-            "threshold": cfg.thresholds.limits_overcommit_ratio,
-        }
-
-    if requests_overcommit:
-        eviction_suggestion = {
-            "reason": "节点已出现 requests overcommit，建议优先评估 BestEffort Pod 的迁移或驱逐影响。",
-            "best_effort_candidates": best_effort_pods,
-            "threshold": cfg.thresholds.requests_overcommit_ratio,
-        }
+    coverage=_COVERAGE.get()
+    complete=resources_complete and audit_complete and alloc_cpu_m>0 and alloc_mem_b>0
+    if not complete:_mark_incomplete("Resource audit incomplete; overcommit is unknown")
+    requests_overcommit=(cpu_req_ratio>cfg.thresholds.requests_overcommit_ratio or mem_req_ratio>cfg.thresholds.requests_overcommit_ratio) if complete else None
+    limits_overcommit=(cpu_lim_ratio>cfg.thresholds.limits_overcommit_ratio or mem_lim_ratio>cfg.thresholds.limits_overcommit_ratio) if complete and cpu_lim_ratio is not None and mem_lim_ratio is not None else None
+    limits_warning={"reason":"Some container limits are unbounded; configured sums are not total caps","threshold":cfg.thresholds.limits_overcommit_ratio} if unbounded_cpu or unbounded_memory else None
+    if limits_overcommit:limits_warning={"reason":"Configured limits exceed allocatable threshold","threshold":cfg.thresholds.limits_overcommit_ratio}
+    advice=resource_advice(contributors,{"requests_overcommit":requests_overcommit})
 
     return {
         "node": node_name,
@@ -1068,6 +1149,8 @@ def get_node_resource_usage(
             "memory_ratio": mem_lim_ratio,
         },
         "live_usage": metric_view,
+        "resource_advice": advice,
+        "limits_unbounded": {"cpu":unbounded_cpu,"memory":unbounded_memory},
         "overcommit": {
             "requests": requests_overcommit,
             "limits": limits_overcommit,
