@@ -23,7 +23,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -629,12 +629,8 @@ def _pod_effective_resources(pod: client.V1Pod) -> MCPPodResource:
     )
 
 
-def _pod_restart_count(pod: client.V1Pod) -> int:
-    """累计 Pod 中所有容器的 restartCount，作为“重启偏高”的基础指标。"""
-    total = 0
-    for cs in pod.status.container_statuses or []:
-        total += int(cs.restart_count or 0)
-    return total
+def _pod_restart_count(pod):
+    return sum(int(_value(cs,"restart_count",0) or 0) for cs,_ in _container_statuses(pod))
 
 
 def _pod_qos_class(pod: client.V1Pod) -> str:
@@ -644,15 +640,12 @@ def _pod_qos_class(pod: client.V1Pod) -> str:
     return "Unknown"
 
 
-def _pod_basic_view(pod: client.V1Pod) -> dict[str, Any]:
-    """Pod 的最小摘要结构（用于列表/样例），避免把完整对象直接暴露给 LLM。"""
-    return {
-        "namespace": getattr(pod.metadata, "namespace", "") or "",
-        "name": getattr(pod.metadata, "name", "") or "",
-        "phase": getattr(pod.status, "phase", "") or "",
-        "qos_class": _pod_qos_class(pod),
-        "restart_count": _pod_restart_count(pod),
-    }
+def _pod_basic_view(pod, thresholds=None):
+    findings=evaluate_pod(pod,thresholds=thresholds or Thresholds(),now=_now_utc())
+    return {"namespace":_value(_value(pod,"metadata"),"namespace","") or "",
+            "name":_value(_value(pod,"metadata"),"name","") or "",
+            "phase":_value(_value(pod,"status"),"phase","") or "", "qos_class":_pod_qos_class(pod),
+            "restart_count":_pod_restart_count(pod),"findings":[asdict(f) for f in findings],"issue":summarize_issue(findings)}
 
 
 def _node_metric_view(custom, node_name, snapshot=None):
@@ -690,33 +683,106 @@ _BAD_POD_REASONS = {
 }
 
 
-def _pod_issue(pod: client.V1Pod, restart_threshold: int) -> str | None:
-    """
-    判断 Pod 是否存在“明显异常信号”。
+@dataclass
+class Finding:
+    code: str
+    severity: str
+    container: str | None = None
+    evidence: dict = field(default_factory=dict)
 
-    返回：
-    - None：未发现问题
-    - str：问题描述（用于上层收集进结果）
-    """
 
-    if not pod.status:
-        return "missing_status"
-    phase = pod.status.phase or ""
-    if phase in {"Failed", "Unknown"}:
-        return f"phase={phase}"
+def _value(obj, name, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj,dict):
+        camel = name.split("_")[0]+"".join(part.title() for part in name.split("_")[1:])
+        return obj.get(name,obj.get(camel,default))
+    return getattr(obj,name,default)
 
-    cs_list = pod.status.container_statuses or []
-    for cs in cs_list:
-        if cs.state and cs.state.waiting and cs.state.waiting.reason in _BAD_POD_REASONS:
-            return f"waiting={cs.state.waiting.reason}"
-        if cs.last_state and cs.last_state.terminated and cs.last_state.terminated.reason in _BAD_POD_REASONS:
-            return f"terminated={cs.last_state.terminated.reason}"
 
-    if restart_threshold > 0:
-        for cs in cs_list:
-            if (cs.restart_count or 0) >= restart_threshold:
-                return f"restart_count>={restart_threshold}"
+def _age_seconds(timestamp, now):
+    if isinstance(timestamp,str):
+        try:
+            timestamp = datetime.fromisoformat(timestamp.replace("Z","+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(timestamp,datetime) or timestamp.tzinfo is None:
+        return None
+    age=(now-timestamp).total_seconds()
+    return age if age >= 0 else None
+
+
+def _container_statuses(pod):
+    status=_value(pod,"status")
+    return [(item,"app") for item in (_value(status,"container_statuses") or [])]+[(item,"init") for item in (_value(status,"init_container_statuses") or [])]
+
+
+def evaluate_pod(pod, *, thresholds: Thresholds, now: datetime) -> list[Finding]:
+    status=_value(pod,"status")
+    if status is None:
+        return [Finding("MissingStatus","warning")]
+    phase=_value(status,"phase","")
+    findings=[]
+    if phase in {"Failed","Unknown"}:
+        findings.append(Finding("Pod"+phase,"error",evidence={"phase":phase}))
+    for cs,kind in _container_statuses(pod):
+        name=_value(cs,"name")
+        state=_value(cs,"state")
+        waiting=_value(state,"waiting")
+        terminated=_value(state,"terminated")
+        previous=_value(_value(cs,"last_state"),"terminated")
+        reason=_value(waiting,"reason")
+        if reason in _BAD_POD_REASONS:
+            findings.append(Finding(reason,"error",name,{"state":"waiting","kind":kind}))
+        if terminated is not None and (_value(terminated,"exit_code",0) or _value(terminated,"reason") in _BAD_POD_REASONS):
+            findings.append(Finding(_value(terminated,"reason") or "ContainerTerminated","error",name,
+                                    {"state":"terminated","kind":kind,"exit_code":_value(terminated,"exit_code")}))
+        if previous is not None and _value(previous,"reason") in _BAD_POD_REASONS:
+            findings.append(Finding(_value(previous,"reason"),"info",name,{"state":"historical","kind":kind}))
+        restarts=_value(cs,"restart_count",0) or 0
+        if isinstance(restarts,int) and restarts>=thresholds.pod_restart_count:
+            findings.append(Finding("RestartCount","warning",name,{"count":restarts,"threshold":thresholds.pod_restart_count,"kind":kind}))
+    created=_value(_value(pod,"metadata"),"creation_timestamp")
+    if phase=="Pending":
+        age=_age_seconds(created,now)
+        severity="warning" if age is None or age>=thresholds.pending_seconds else "info"
+        findings.append(Finding("Pending" if severity=="warning" else "Starting",severity,evidence={"age_seconds":age}))
+    elif phase=="Running":
+        condition=next((c for c in (_value(status,"conditions") or []) if _value(c,"type")=="Ready"),None)
+        unready=_value(condition,"status")=="False" or any(_value(cs,"ready") is False for cs,kind in _container_statuses(pod) if kind=="app")
+        if unready:
+            age=_age_seconds(_value(condition,"last_transition_time") if condition is not None else created,now)
+            severity="warning" if age is None or age>=thresholds.ready_seconds else "info"
+            findings.append(Finding("NotReady" if severity=="warning" else "Starting",severity,evidence={"age_seconds":age}))
+    ranks={"error":0,"warning":1,"info":2}
+    findings.sort(key=lambda finding:(ranks[finding.severity],0 if finding.code.startswith("Pod") else 1,finding.code,finding.container or ""))
+    return findings
+
+
+def summarize_issue(findings):
+    for finding in findings:
+        if finding.severity=="info":
+            continue
+        if finding.code in {"PodFailed","PodUnknown"}:
+            return "phase="+finding.evidence["phase"]
+        state=finding.evidence.get("state")
+        if state in {"waiting","terminated"}:
+            return state+"="+finding.code
+        if finding.code=="RestartCount":
+            return "restart_count>="+str(finding.evidence["threshold"])
+        return finding.code
     return None
+
+
+def select_problem_container(pod, findings):
+    return next((finding.container for finding in findings if finding.container and finding.severity!="info"),None)
+
+
+def _pod_issue(pod, restart_threshold):
+    thresholds=Thresholds().model_copy(update={"pod_restart_count":max(restart_threshold,1)})
+    findings=evaluate_pod(pod,thresholds=thresholds,now=_now_utc())
+    if restart_threshold<=0:findings=[f for f in findings if f.code!="RestartCount"]
+    return summarize_issue(findings)
 
 
 
@@ -798,19 +864,15 @@ def _event_brief(event: client.V1Event) -> dict[str, str]:
     }
 
 
-def _pod_issue_summary(pod: client.V1Pod, restart_threshold: int) -> str | None:
-    """生成更适合列表展示的 issue 字段：先看硬故障，再看重启偏高。"""
-    issue = _pod_issue(pod, restart_threshold=0)
-    if issue:
-        return issue
-    heavy = _pod_issue(pod, restart_threshold=restart_threshold)
-    if heavy == f"restart_count>={restart_threshold}":
-        return heavy
-    return None
+def _pod_issue_summary(pod, restart_threshold, thresholds=None):
+    thresholds=thresholds or Thresholds().model_copy(update={"pod_restart_count":max(restart_threshold,1)})
+    return summarize_issue(evaluate_pod(pod,thresholds=thresholds,now=_now_utc()))
 
 
-def _pod_suggestions(issue: str | None, phase: str) -> list[str]:
+def _pod_suggestions(issue: str | None, phase: str, findings=None) -> list[str]:
     """把常见 issue/phase 映射成可操作的排障建议（给 LLM 作为输出参考）。"""
+    if findings and any(f.code=="Starting" for f in findings):
+        return ["Pod is still starting; inspect readiness and events before judging health."]
     if issue is None and phase == "Running":
         return ["Pod 当前未发现明显异常，可继续检查依赖服务、探针与业务日志。"]
     if issue is None and phase == "Pending":
@@ -873,7 +935,7 @@ def get_node_detail(
     metrics = _node_metric_view(kube.custom, node_name)
     detail = _parse_node(node)
     detail["pod_count"] = len(pods)
-    detail["pods_sample"] = [_pod_basic_view(pod) for pod in pods[:20]]
+    detail["pods_sample"] = [_pod_basic_view(pod,_get_runtime_config().thresholds) for pod in pods[:20]]
     detail["metrics"] = metrics
     return detail
 
@@ -1067,20 +1129,14 @@ def list_node_pods(node_name: Annotated[str,Field(description="Node name")],
     page=_k8s_api_call(kube.core.list_pod_for_all_namespaces,field_selector=f"spec.nodeName={node_name}",limit=limit,_continue=continue_token)
     pods, token=_page_parts(page)
     threshold=_get_runtime_config().thresholds.pod_restart_count
-    items=[{**_pod_basic_view(pod),"issue":_pod_issue_summary(pod,threshold)} for pod in pods
+    items=[_pod_basic_view(pod,_get_runtime_config().thresholds) for pod in pods
            if getattr(pod.status,"phase",None) not in {"Succeeded","Failed"}]
     return {"cluster":kube.display_name,"node":node_name,"count":len(items),"returned":len(items),
             "items":items,"continue_token":token,"coverage_scope":"page"}
 
 
-def _find_problem_container_name(pod: client.V1Pod) -> str | None:
-    """尝试找出最可能出问题的容器名（用于读取日志）。"""
-    for cs in pod.status.container_statuses or []:
-        if cs.state and cs.state.waiting and cs.state.waiting.reason in _BAD_POD_REASONS:
-            return cs.name
-        if cs.last_state and cs.last_state.terminated and cs.last_state.terminated.reason in _BAD_POD_REASONS:
-            return cs.name
-    return None
+def _find_problem_container_name(pod):
+    return select_problem_container(pod,evaluate_pod(pod,thresholds=_get_runtime_config().thresholds,now=_now_utc()))
 
 
 def _read_pod_log_excerpt(
@@ -1134,8 +1190,9 @@ def diagnose_pod_issues(
 
     # issue 先识别明显异常，再识别“重启偏高”，这样输出更符合排障优先级。
     phase = pod.status.phase if pod.status else ""
-    issue = _pod_issue_summary(pod, cfg.thresholds.pod_restart_count)
-    problem_container = _find_problem_container_name(pod)
+    findings = evaluate_pod(pod,thresholds=cfg.thresholds,now=_now_utc())
+    issue = summarize_issue(findings)
+    problem_container = select_problem_container(pod,findings)
 
     # Pending/CrashLoopBackOff 等场景下，事件信息对定位非常关键，这里做采样返回。
     events = _k8s_api_call(
@@ -1165,7 +1222,8 @@ def diagnose_pod_issues(
         "problem_container": problem_container,
         "events": [_event_brief(event) for event in events[:20]],
         "log_excerpt": log_excerpt,
-        "suggestions": _pod_suggestions(issue, phase),
+        "findings": [asdict(f) for f in findings],
+        "suggestions": _pod_suggestions(issue, phase, findings),
     }
 
 
