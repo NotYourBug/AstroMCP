@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import ipaddress
 import json
+import locale
 import logging
 import math
 import os
@@ -295,8 +296,13 @@ def _check_host(host: str) -> Optional[str]:
     """校验主机名/IP，合法返回 None，否则返回错误信息"""
     if not host or not host.strip():
         return "host 不能为空"
-    if HOST_FORBIDDEN.search(host):
+    if HOST_FORBIDDEN.search(host) or any(c.isspace() for c in host) or host.startswith("-"):
         return f"host 包含非法字符: {host}"
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?", label) for label in host.rstrip(".").split(".")):
+            return "Invalid hostname or IP"
     return None
 
 
@@ -453,6 +459,58 @@ def parse_tcp_output(text: str) -> int:
     return len(rows)
 
 
+async def probe_ping(host: str, *, timeout: float = 5.0) -> dict:
+    if _check_host(host):
+        return _err(host, "Invalid host", error_code="INVALID_INPUT", probe_origin="server")
+    process = None
+    try:
+        flag = "-n" if platform.system().lower() == "windows" else "-c"
+        process = await asyncio.create_subprocess_exec("ping", flag, "3", host,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
+        encoding = locale.getpreferredencoding(False)
+        output = (stdout+stderr).decode(encoding, errors="replace")
+        if process.returncode == 0:
+            return _ok(host=host, reachable=True, probe_origin="server", summary=_parse_ping_summary(output) or output[:2000])
+        if process.returncode == 1:
+            return _ok(host=host, reachable=False, probe_origin="server", detail="No successful ICMP reply; this does not prove host failure")
+        return _err(host, "ping command failed", error_code="COMMAND_FAILED", probe_origin="server")
+    except FileNotFoundError:
+        return _err(host, "ping is not installed", error_code="NOT_FOUND", probe_origin="server")
+    except (TimeoutError, asyncio.TimeoutError):
+        return _err(host, "ping timed out", error_code="TIMEOUT", probe_origin="server")
+    finally:
+        if process is not None and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()
+            await process.wait()
+
+
+async def probe_tcp(host: str, port: int, *, timeout: float = 5.0) -> dict:
+    if _check_host(host) or _check_port(port):
+        return _err(host, "Invalid host or port", error_code="INVALID_INPUT", open=None, probe_origin="server")
+    writer = None
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port,
+            family=socket.AF_UNSPEC, happy_eyeballs_delay=.25), timeout)
+        return _ok(host=host, port=port, open=True, probe_origin="server")
+    except ConnectionRefusedError:
+        return _ok(host=host, port=port, open=False, probe_origin="server")
+    except socket.gaierror:
+        return _err(host, "DNS lookup failed", error_code="DNS_ERROR", open=None, probe_origin="server")
+    except (TimeoutError, asyncio.TimeoutError):
+        return _err(host, "TCP connection timed out", error_code="TIMEOUT", open=None, probe_origin="server")
+    except OSError:
+        return _err(host, "TCP target unreachable", error_code="UNREACHABLE", open=None, probe_origin="server")
+    finally:
+        if writer is not None:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), min(timeout, 1))
+
+
 async def _collect_remote(metric, os_type, host, port, username, password, key_path, path=None, threshold=85):
     commands = {
         ("cpu","linux"):"LC_ALL=C vmstat 1 2", ("cpu","mac"):"LC_ALL=C top -l 2 -s 1",
@@ -544,41 +602,7 @@ async def detect_remote_os(
 async def check_host_status(
     hostname: Annotated[str, Field(description="主机名或 IP 地址")],
 ) -> dict:
-    """检查目标主机的连通性（通过系统 ping 命令）"""
-    err = _check_host(hostname)
-    if err:
-        return _err(hostname, err)
-
-    param = "-n" if platform.system().lower() == "windows" else "-c"
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "ping", param, "3", hostname,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode == 0:
-            # 提取关键统计信息，避免泄露原始 IP 等细节
-            output = stdout.decode("utf-8", errors="ignore")
-            summary = _parse_ping_summary(output)
-            return _ok(
-                host=hostname,
-                reachable=True,
-                summary=summary or output.strip(),
-            )
-        else:
-            return _ok(
-                host=hostname,
-                reachable=False,
-                detail=stderr.decode("utf-8", errors="ignore").strip(),
-            )
-    except FileNotFoundError:
-        return _err(hostname, "系统未找到 ping 命令")
-    except Exception as e:
-        logger.exception("ping %s 异常", hostname)
-        return _err(hostname, f"ping 异常: {e}")
+    return await probe_ping(hostname)
 
 
 def _parse_ping_summary(output: str) -> Optional[str]:
@@ -797,34 +821,7 @@ async def check_service_port(
     host: Annotated[str, Field(description="主机名或 IP 地址")],
     port: Annotated[int, Field(description="端口号")],
 ) -> dict:
-    """检查目标主机的指定端口是否可连通（TCP connect）"""
-    for err in (_check_host(host), _check_port(port)):
-        if err:
-            return _err(host, err)
-
-    def _check() -> bool:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(TCP_CHECK_TIMEOUT)
-        try:
-            result = sock.connect_ex((host, port))
-            return result == 0
-        except socket.gaierror:
-            return False
-        except Exception:
-            return False
-        finally:
-            sock.close()
-
-    try:
-        is_open = await asyncio.to_thread(_check)
-        return _ok(
-            host=host,
-            port=port,
-            open=is_open,
-        )
-    except Exception as e:
-        logger.exception("端口检查异常 %s:%d", host, port)
-        return _err(host, f"端口检查异常: {e}")
+    return await probe_tcp(host, port)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
