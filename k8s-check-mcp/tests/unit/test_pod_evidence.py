@@ -2,6 +2,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as N
 
+import pytest
 from k8s_check_mcp.client import read_events, read_log_excerpt
 
 
@@ -104,3 +105,111 @@ def test_permission_failure_returns_partial_evidence(cluster):
     gateway.clients.core.list_namespaced_event = denied
     result = read_events(gateway, namespace="default", pod_uid="uid", deadline=time.monotonic() + 1)
     assert not result.complete and result.data == [] and result.warnings
+
+
+@pytest.fixture
+def diagnostic_case(node_pods):
+    from kubernetes import client
+
+    inspector, gateway, _, pods = node_pods()
+    pod = pods[0]
+    pod.status.phase = "Failed"
+    pod.status.container_statuses = [
+        client.V1ContainerStatus(
+            name="app",
+            image="TEST_ONLY",
+            image_id="TEST_ONLY",
+            ready=False,
+            restart_count=0,
+            state=client.V1ContainerState(
+                terminated=client.V1ContainerStateTerminated(exit_code=137, reason="OOMKilled")
+            ),
+        )
+    ]
+    gateway.clients.core.read_namespaced_pod = lambda **kwargs: pod
+    gateway.clients.core.list_namespaced_event = lambda **kwargs: N(
+        items=[], metadata=N(_continue=None)
+    )
+    calls = []
+
+    def log(**kwargs):
+        calls.append(kwargs)
+        return "TEST_ONLY_OOM_EVIDENCE"
+
+    gateway.clients.core.read_namespaced_pod_log = log
+    return inspector, gateway, pod, calls
+
+
+def test_failed_oom_collects_current_logs(diagnostic_case):
+    inspector, _, pod, calls = diagnostic_case
+    result = inspector.diagnose_pod_issues(pod.metadata.name, "default")
+    assert result["issue"] == "phase=Failed"
+    assert result["problem_container"] == "app"
+    assert "TEST_ONLY_OOM_EVIDENCE" in result["log_excerpt"]
+    assert calls[0]["previous"] is False
+    assert calls[0]["limit_bytes"] == 16384
+
+
+def test_crashloop_prefers_previous_logs(diagnostic_case):
+    from kubernetes import client
+
+    inspector, _, pod, calls = diagnostic_case
+    pod.status.phase = "Running"
+    status = pod.status.container_statuses[0]
+    status.restart_count = 3
+    status.state = client.V1ContainerState(
+        waiting=client.V1ContainerStateWaiting(reason="CrashLoopBackOff")
+    )
+    result = inspector.diagnose_pod_issues(pod.metadata.name, "default")
+    assert result["log_excerpt"] and calls[0]["previous"] is True
+
+
+def test_recovered_oom_does_not_collect_logs(diagnostic_case):
+    from kubernetes import client
+
+    inspector, _, pod, calls = diagnostic_case
+    pod.status.phase = "Running"
+    status = pod.status.container_statuses[0]
+    status.last_state = status.state
+    status.state = client.V1ContainerState(running=client.V1ContainerStateRunning())
+    status.restart_count = 1
+    status.ready = True
+    result = inspector.diagnose_pod_issues(pod.metadata.name, "default")
+    assert result["issue"] is None and calls == []
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_failed_oom_log_denied_retains_findings(diagnostic_case, disabled):
+    from kubernetes.client.exceptions import ApiException
+
+    inspector, gateway, pod, calls = diagnostic_case
+    if disabled:
+        gateway.settings = gateway.settings.model_copy(update={"include_logs": False})
+
+    def denied(**kwargs):
+        calls.append(kwargs)
+        raise ApiException(status=403)
+
+    gateway.clients.core.read_namespaced_pod_log = denied
+    result = inspector.diagnose_pod_issues(pod.metadata.name, "default")
+    assert not result["complete"] and result["warnings"]
+    assert any(f["code"] == "OOMKilled" for f in result["findings"])
+    assert len(calls) == (0 if disabled else 1)
+
+
+def test_current_log_failure_falls_back_to_previous(diagnostic_case):
+    from kubernetes.client.exceptions import ApiException
+
+    inspector, gateway, pod, calls = diagnostic_case
+
+    def fallback(**kwargs):
+        calls.append(kwargs)
+        if not kwargs["previous"]:
+            raise ApiException(status=404)
+        return "TEST_ONLY_PREVIOUS"
+
+    gateway.clients.core.read_namespaced_pod_log = fallback
+    result = inspector.diagnose_pod_issues(pod.metadata.name, "default")
+    assert [call["previous"] for call in calls] == [False, True]
+    assert result["log_excerpt"] == "TEST_ONLY_PREVIOUS"
+    assert not result["complete"] and result["warnings"]

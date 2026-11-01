@@ -190,4 +190,4 @@ Events 用 involvedObject.uid 过滤并取最新 20 条；日志请求带 limit_
 
 独立 builder check 已完成。唯一需要补齐的关键问题是分页与全量扫描边界；已在第 7 节增加工具映射、count/continuation/截断语义。该问题属于可由工程方案解决的接口选择，已明确为本设计提案，未假称用户逐项选择。用户最终仍需审阅整份设计与计划。
 
-参考依据：[既有审查](../../../MCP代码审查与优化建议.md)、[uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/)、[FastMCP 运行与传输](https://gofastmcp.com/deployment/running-server)、[Kubernetes sidecar](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/)、[Paramiko channel](https://docs.paramiko.org/en/stable/api/channel.html)。
+参考依据：[既有审查（Git 历史）](https://github.com/NotYourBug/AstroMCP/blob/c61d407/MCP%E4%BB%A3%E7%A0%81%E5%AE%A1%E6%9F%A5%E4%B8%8E%E4%BC%98%E5%8C%96%E5%BB%BA%E8%AE%AE.md)、[uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/)、[FastMCP 运行与传输](https://gofastmcp.com/deployment/running-server)、[Kubernetes sidecar](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/)、[Paramiko channel](https://docs.paramiko.org/en/stable/api/channel.html)。

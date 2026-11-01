@@ -48,6 +48,8 @@
 
 日志在服务端限制为 16384 bytes、展示为 4000 chars；Events 按 Pod UID 筛选并选择最新 20 条。脱敏覆盖常见密码、token、私钥格式，无法保证识别任意业务敏感内容。关闭日志或收窄凭据权限可减少可读取内容。
 
+问题容器零重启时优先读取 current 日志，否则优先 previous；缺失时按错误类别回退，所有尝试共用工具 deadline。详情样本上限 20、资源明细上限 50 保持固定，returned/truncated 字段及 unknown 容量语义见 [兼容与结果说明](compatibility.md)。
+
 ## 复现锁定安装
 
 在仓库根目录执行 `uv sync --locked --all-packages --all-extras --dev` 可复现开发与验收环境。兼容 pip 的 requirements 从同一份根锁导出，更新依赖后重新生成：

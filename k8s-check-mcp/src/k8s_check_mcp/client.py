@@ -255,12 +255,18 @@ def read_events(gateway, *, namespace: str, pod_uid: str, deadline: float) -> Ev
 
 
 def read_log_excerpt(
-    gateway, *, namespace: str, pod_name: str, container_name: str, deadline: float
+    gateway,
+    *,
+    namespace: str,
+    pod_name: str,
+    container_name: str,
+    deadline: float,
+    prefer_previous: bool = True,
 ) -> EvidenceResult:
     if not gateway.settings.include_logs:
         return EvidenceResult("", False, ["Log collection disabled by configuration"])
     warnings = []
-    for previous in (True, False):
+    for previous in (True, False) if prefer_previous else (False, True):
         try:
             text = gateway.call(
                 gateway.clients.core.read_namespaced_pod_log,

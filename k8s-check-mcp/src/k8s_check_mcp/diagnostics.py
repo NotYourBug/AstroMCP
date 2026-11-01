@@ -198,9 +198,9 @@ def _pod_suggestions(issue: str | None, phase: str, findings=None) -> list[str]:
     return out
 
 
-def node_capacity(node):
+def node_capacity(node, resource_field="capacity"):
     """Return valid utilization denominators, preserving unknown dimensions as None."""
-    capacity = _value(_value(node, "status"), "capacity") or {}
+    capacity = _value(_value(node, "status"), resource_field) or {}
     values = []
     for key, parse in (("cpu", _cpu_to_millicores), ("memory", _memory_to_bytes)):
         try:

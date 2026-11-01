@@ -37,4 +37,4 @@ Windows 受限沙箱可能阻塞 asyncio 的 socketpair，需要在允许本机 
 - `examples/`：配置、客户端和工具调用示例；保留 `TEST_ONLY` 占位值。
 - `docs/validation/`：审查与验证记录，明确区分模拟、本机协议和真实基础设施证据。
 
-历史[代码审查](MCP代码审查与优化建议.md)、[设计](docs/superpowers/specs/2026-10-25-astromcp-design.md)及[实施计划](docs/superpowers/plans/2026-10-25-astromcp-master.md)保留作为演进记录。当前运行实现以各目录的 src 包为准。
+历史[代码审查](https://github.com/NotYourBug/AstroMCP/blob/c61d407/MCP%E4%BB%A3%E7%A0%81%E5%AE%A1%E6%9F%A5%E4%B8%8E%E4%BC%98%E5%8C%96%E5%BB%BA%E8%AE%AE.md)可从 Git 历史查阅，[设计](docs/superpowers/specs/2026-10-25-astromcp-design.md)及[实施计划](docs/superpowers/plans/2026-10-25-astromcp-master.md)保留作为演进记录。当前运行实现以各目录的 src 包为准。
