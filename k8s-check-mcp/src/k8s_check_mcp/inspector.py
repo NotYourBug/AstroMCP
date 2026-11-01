@@ -25,6 +25,7 @@ from .models import (
     _DEADLINE,
     EvidenceResult,
     K8sOperationError,
+    _container_statuses,
     _mark_incomplete,
     _value,
 )
@@ -42,7 +43,6 @@ from .presentation import (
     node_metric_view,
     pod_basic_view,
 )
-from .quantities import _cpu_to_millicores, _memory_to_bytes
 from .resources import _pod_effective_resources, resource_advice
 
 logger = logging.getLogger("astromcp.k8s")
@@ -213,6 +213,10 @@ class K8sInspector:
         detail["pods_sample"] = [
             self.pod_basic_view(pod, self.settings.thresholds) for pod in pods[:20]
         ]
+        detail["pods_sample_returned"] = len(detail["pods_sample"])
+        detail["pods_sample_truncated"] = len(pods) > 20
+        if detail["pods_sample_truncated"]:
+            _mark_incomplete("Pod sample truncated to 20; use list_node_pods pagination")
         detail["metrics"] = metrics
         return detail
 
@@ -227,8 +231,6 @@ class K8sInspector:
         cfg = self.settings
         node = self.call(kube.core.read_node, node_name)
         pods = self.active_pods_on_node(kube.core, node_name)
-        allocatable = node.status.allocatable if node.status else {}
-        capacity = node.status.capacity if node.status else {}
         total_cpu_req_m = 0
         total_cpu_lim_m = 0
         total_mem_req_b = 0
@@ -278,19 +280,19 @@ class K8sInspector:
                         "restart_count": _pod_restart_count(pod),
                     }
                 )
-        alloc_cpu_m = _cpu_to_millicores(str(allocatable.get("cpu", "0")))
-        alloc_mem_b = _memory_to_bytes(str(allocatable.get("memory", "0")))
-        cap_cpu_m = _cpu_to_millicores(str(capacity.get("cpu", "0")))
-        cap_mem_b = _memory_to_bytes(str(capacity.get("memory", "0")))
-        cpu_req_ratio = _ratio(total_cpu_req_m, alloc_cpu_m)
-        mem_req_ratio = _ratio(total_mem_req_b, alloc_mem_b)
-        cpu_lim_ratio = None if unbounded_cpu else _ratio(total_cpu_lim_m, alloc_cpu_m)
-        mem_lim_ratio = None if unbounded_memory else _ratio(total_mem_lim_b, alloc_mem_b)
         audit_coverage = _COVERAGE.get()
         audit_complete = audit_coverage is None or audit_coverage["complete"]
+        alloc_cpu_m, alloc_mem_b = node_capacity(node, "allocatable")
+        cap_cpu_m, cap_mem_b = node_capacity(node)
+        if None in (alloc_cpu_m, alloc_mem_b, cap_cpu_m, cap_mem_b):
+            _mark_incomplete("Node capacity/allocatable missing, zero or invalid")
+        cpu_req_ratio = _ratio(total_cpu_req_m, alloc_cpu_m or 0)
+        mem_req_ratio = _ratio(total_mem_req_b, alloc_mem_b or 0)
+        cpu_lim_ratio = None if unbounded_cpu else _ratio(total_cpu_lim_m, alloc_cpu_m or 0)
+        mem_lim_ratio = None if unbounded_memory else _ratio(total_mem_lim_b, alloc_mem_b or 0)
         metric_view = self.node_metric_view(kube.custom, node_name)
         eviction_suggestion = None
-        complete = resources_complete and audit_complete and (alloc_cpu_m > 0) and (alloc_mem_b > 0)
+        complete = resources_complete and audit_complete and None not in (alloc_cpu_m, alloc_mem_b)
         if not complete:
             _mark_incomplete("Resource audit incomplete; overcommit is unknown")
         requests_overcommit = (
@@ -319,21 +321,26 @@ class K8sInspector:
                 "threshold": cfg.thresholds.limits_overcommit_ratio,
             }
         advice = resource_advice(contributors, {"requests_overcommit": requests_overcommit})
+        breakdown_truncated = len(pods) > 50
+        if breakdown_truncated:
+            _mark_incomplete(
+                "Pod resource breakdown truncated to 50; use list_node_pods for evidence"
+            )
         return {
             "node": node_name,
             "cluster": kube.display_name,
             "pod_count": len(pods),
             "allocatable": {
                 "cpu_m": alloc_cpu_m,
-                "cpu_human": _format_cpu_m(alloc_cpu_m),
+                "cpu_human": _format_cpu_m(alloc_cpu_m) if alloc_cpu_m is not None else None,
                 "memory_bytes": alloc_mem_b,
-                "memory_human": _format_bytes(alloc_mem_b),
+                "memory_human": _format_bytes(alloc_mem_b) if alloc_mem_b is not None else None,
             },
             "capacity": {
                 "cpu_m": cap_cpu_m,
-                "cpu_human": _format_cpu_m(cap_cpu_m),
+                "cpu_human": _format_cpu_m(cap_cpu_m) if cap_cpu_m is not None else None,
                 "memory_bytes": cap_mem_b,
-                "memory_human": _format_bytes(cap_mem_b),
+                "memory_human": _format_bytes(cap_mem_b) if cap_mem_b is not None else None,
             },
             "requests": {
                 "cpu_m": total_cpu_req_m,
@@ -363,6 +370,8 @@ class K8sInspector:
             "eviction_suggestion": eviction_suggestion,
             "limits_warning": limits_warning,
             "pod_breakdown": pod_breakdown,
+            "pod_breakdown_returned": len(pod_breakdown),
+            "pod_breakdown_truncated": breakdown_truncated,
         }
 
     @_operation
@@ -468,7 +477,7 @@ class K8sInspector:
         """
         对指定 Pod 做精简版诊断：
         - Pending：补充事件信息
-        - CrashLoopBackOff / ImagePullBackOff 等：尝试读取 previous 日志
+        - 当前问题容器：按重启状态选择 current/previous 有界日志
         """
         kube = self.gateway.clients
         pod = self.call(kube.core.read_namespaced_pod, name=pod_name, namespace=namespace)
@@ -485,13 +494,12 @@ class K8sInspector:
             deadline=deadline,
         )
         log_result = EvidenceResult("")
-        if (
-            problem_container
-            and issue
-            and any(
-                reason in issue
-                for reason in ("CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "OOMKilled")
-            )
+        if problem_container and any(
+            finding.container == problem_container
+            and finding.severity == "error"
+            and finding.code
+            in {"CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "OOMKilled"}
+            for finding in findings
         ):
             log_result = read_log_excerpt(
                 gateway,
@@ -499,6 +507,11 @@ class K8sInspector:
                 pod_name=pod_name,
                 container_name=problem_container,
                 deadline=deadline,
+                prefer_previous=any(
+                    _value(cs, "name") == problem_container
+                    and (_value(cs, "restart_count", 0) or 0) > 0
+                    for cs, _ in _container_statuses(pod)
+                ),
             )
         for warning in event_result.warnings + log_result.warnings:
             _mark_incomplete(warning)

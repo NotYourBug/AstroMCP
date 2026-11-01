@@ -59,3 +59,39 @@ def cluster(legacy_module, monkeypatch):
         return m, gateway, nodes, calls
 
     return make
+
+
+@pytest.fixture
+def node_pods(cluster):
+    def make(count=1, cpu="5", memory="1Gi"):
+        from kubernetes import client
+
+        inspector, gateway, nodes, _ = cluster(1)
+        pods = [
+            client.V1Pod(
+                metadata=client.V1ObjectMeta(name=f"app-{i}", namespace="default", uid=f"uid-{i}"),
+                spec=client.V1PodSpec(
+                    containers=[
+                        client.V1Container(
+                            name="app",
+                            resources=client.V1ResourceRequirements(
+                                requests={"cpu": cpu, "memory": memory}
+                            ),
+                        )
+                    ]
+                ),
+                status=client.V1PodStatus(
+                    phase="Running",
+                    qos_class="Burstable",
+                    conditions=[client.V1PodCondition(type="Ready", status="True")],
+                ),
+            )
+            for i in range(count)
+        ]
+        gateway.clients.core.read_node = lambda *args, **kwargs: nodes[0]
+        gateway.clients.core.list_pod_for_all_namespaces = lambda **kwargs: N(
+            items=pods, metadata=N(_continue=None)
+        )
+        return inspector, gateway, nodes, pods
+
+    return make
