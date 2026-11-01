@@ -21,11 +21,22 @@ class LocalCollector:
     async def call(self, fn, *args, **kwargs):
         deadline = _TOOL_DEADLINE.get() or time.monotonic() + self.settings.tool_timeout_seconds
         queue_end = min(deadline, time.monotonic() + self.settings.queue_timeout_seconds)
-        while not self._sem.acquire(blocking=False):
-            if time.monotonic() >= queue_end:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise HostOperationError("TIMEOUT", "Local collector deadline exceeded")
+            if self._sem.acquire(blocking=False):
+                break
+            if now >= queue_end:
                 raise HostOperationError("BUSY", "Local collector workers are busy")
             await asyncio.sleep(0.005)
-        future = self._pool.submit(fn, *args, **kwargs)
+        try:
+            if time.monotonic() >= deadline:
+                raise HostOperationError("TIMEOUT", "Local collector deadline exceeded")
+            future = self._pool.submit(fn, *args, **kwargs)
+        except BaseException:
+            self._sem.release()
+            raise
         self._active.add(future)
 
         def finished(done):
@@ -35,9 +46,12 @@ class LocalCollector:
         future.add_done_callback(finished)
         wrapped = asyncio.wrap_future(future)
         wrapped.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             asyncio.shield(wrapped), max(deadline - time.monotonic(), 0.001)
         )
+        if time.monotonic() >= deadline:
+            raise HostOperationError("TIMEOUT", "Local collector deadline exceeded")
+        return result
 
     async def collect_cpu(self):
         return {

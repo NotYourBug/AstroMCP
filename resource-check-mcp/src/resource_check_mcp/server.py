@@ -32,7 +32,10 @@ def _operation(fn):
         request = _REQUEST_ID.set(str(uuid4()))
         host = kwargs.get("host", kwargs.get("hostname", "127.0.0.1"))
         try:
-            return await fn(self, *args, **kwargs)
+            result = await fn(self, *args, **kwargs)
+            if result.get("ok") and time.monotonic() >= _TOOL_DEADLINE.get():
+                raise HostOperationError("TIMEOUT", "Collection deadline exceeded")
+            return result
         except HostOperationError as exc:
             return _err(host, str(exc), error_code=exc.code)
         except (TimeoutError, asyncio.TimeoutError):

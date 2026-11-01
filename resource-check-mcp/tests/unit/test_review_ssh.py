@@ -14,7 +14,7 @@ async def test_probes_receive_remaining_tool_budget(monkeypatch):
     observed = []
     # Control elapsed time instead of comparing a real platform clock's rounded
     # subtraction with an exact 50 ms upper bound.
-    ticks = iter((256.0, 256.01, 512.0, 512.02))
+    ticks = iter((256.0, 256.01, 256.02, 512.0, 512.02, 512.03))
     monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
 
     async def probe(*args, timeout=5):
