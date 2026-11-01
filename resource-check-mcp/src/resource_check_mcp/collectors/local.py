@@ -21,10 +21,14 @@ class LocalCollector:
     async def call(self, fn, *args, **kwargs):
         deadline = _TOOL_DEADLINE.get() or time.monotonic() + self.settings.tool_timeout_seconds
         queue_end = min(deadline, time.monotonic() + self.settings.queue_timeout_seconds)
+        first_attempt = True
         while True:
             now = time.monotonic()
             if now >= deadline:
                 raise HostOperationError("TIMEOUT", "Local collector deadline exceeded")
+            if not first_attempt and now >= queue_end:
+                raise HostOperationError("BUSY", "Local collector workers are busy")
+            first_attempt = False
             if self._sem.acquire(blocking=False):
                 break
             if now >= queue_end:

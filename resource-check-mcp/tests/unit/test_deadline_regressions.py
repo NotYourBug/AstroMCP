@@ -68,6 +68,50 @@ async def test_completed_local_result_after_deadline_is_timeout(monkeypatch):
         await collector.aclose()
 
 
+async def test_expired_queue_does_not_take_newly_freed_slot(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(local, "time", N(monotonic=lambda: clock[0]))
+    collector = local.LocalCollector(HostSettings(queue_timeout_seconds=0.1))
+    for _ in range(4):
+        assert collector._sem.acquire(blocking=False)
+
+    async def advance(_):
+        clock[0] = 100.5
+        collector._sem.release()
+
+    monkeypatch.setattr(
+        local,
+        "asyncio",
+        N(
+            sleep=advance,
+            wrap_future=asyncio.wrap_future,
+            wait_for=asyncio.wait_for,
+            shield=asyncio.shield,
+            wait=asyncio.wait,
+        ),
+    )
+    token = _TOOL_DEADLINE.set(101.0)
+    worker = Mock(return_value=42)
+    try:
+        with pytest.raises(HostOperationError) as error:
+            await collector.call(worker)
+        assert error.value.code == "BUSY"
+        worker.assert_not_called()
+    finally:
+        _TOOL_DEADLINE.reset(token)
+        for _ in range(3):
+            collector._sem.release()
+        await collector.aclose()
+
+
+async def test_zero_queue_budget_allows_immediate_local_work():
+    collector = local.LocalCollector(HostSettings(queue_timeout_seconds=0))
+    try:
+        assert await collector.call(lambda: 42) == 42
+    finally:
+        await collector.aclose()
+
+
 async def test_tool_publication_rechecks_deadline(monkeypatch):
     import resource_check_mcp.server as server
 
@@ -118,6 +162,8 @@ async def test_local_cancel_and_timeout_keep_worker_lease(cancel):
         release.set()
         while collector._active:
             await asyncio.sleep(0.001)
+        # The fresh request proves lease recovery, not 30 ms machine performance.
+        collector.settings = HostSettings(tool_timeout_seconds=2, queue_timeout_seconds=0)
         assert await collector.call(lambda: 43) == 43
     finally:
         release.set()
