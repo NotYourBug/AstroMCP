@@ -4,9 +4,10 @@ import asyncio
 import locale
 import platform
 import socket
+import time
 
 from .config import _check_host, _check_port
-from .models import _err, _ok
+from .models import _TOOL_DEADLINE, _err, _ok
 
 
 def _parse_ping_summary(output: str) -> str | None:
@@ -68,13 +69,21 @@ async def probe_tcp(host: str, port: int, *, timeout: float = 5.0) -> dict:
             open=None,
             probe_origin="server",
         )
-    writer = None
+    deadline = time.monotonic() + timeout
+    tool_deadline = _TOOL_DEADLINE.get()
+    if tool_deadline is not None:
+        deadline = min(deadline, tool_deadline)
+    writer = result = None
     try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
         _, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, family=socket.AF_UNSPEC, happy_eyeballs_delay=0.25),
-            timeout,
+            remaining,
         )
-        return _ok(host=host, port=port, open=True, probe_origin="server")
+        result = _ok(host=host, port=port, open=True, probe_origin="server")
+        return result
     except ConnectionRefusedError:
         return _ok(host=host, port=port, open=False, probe_origin="server")
     except socket.gaierror:
@@ -95,5 +104,21 @@ async def probe_tcp(host: str, port: int, *, timeout: float = 5.0) -> dict:
         )
     finally:
         if writer is not None:
-            writer.close()
-            await asyncio.wait_for(writer.wait_closed(), min(timeout, 1))
+            warning = await _close_tcp_writer(writer, deadline)
+            if warning and result is not None:
+                result["complete"] = False
+                result["warnings"].append(warning)
+
+
+async def _close_tcp_writer(writer, deadline):
+    try:
+        writer.close()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "TCP_CLEANUP_TIMEOUT"
+        await asyncio.wait_for(writer.wait_closed(), min(remaining, 1))
+    except (TimeoutError, asyncio.TimeoutError):
+        return "TCP_CLEANUP_TIMEOUT"
+    except OSError:
+        return "TCP_CLEANUP_FAILED"
+    return None
