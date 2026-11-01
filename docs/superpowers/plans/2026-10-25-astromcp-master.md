@@ -1,5 +1,7 @@
 # AstroMCP 工程基线与交付 Implementation Plan
 
+当前状态入口（2026-11-01）：[本轮收尾追踪](../../validation/2026-11-01-closure.md)。下文执行状态保留为历史快照。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans（推荐本会话顺序实施）或 superpowers:subagent-driven-development 按任务实施。Steps use checkbox (`- [x]`) syntax for tracking.
 
 执行状态（2026-10-25）：M1–M5 本地实施与验收完成；用户已批准首次推送，空仓库的 main 与工作分支已建立，[Draft PR #1](https://github.com/NotYourBug/AstroMCP/pull/1) 已创建。远程 CI 已运行，最新结果见 PR 检查；不自动合并。
